@@ -1,5 +1,13 @@
 # Coding Plan 额度查询
 
+[![Release](https://img.shields.io/github/v/release/Dalizi2026/OpenCodeGoChecker?label=下载&color=2ea44f)](https://github.com/Dalizi2026/OpenCodeGoChecker/releases/latest)
+[![Build](https://github.com/Dalizi2026/OpenCodeGoChecker/actions/workflows/release.yml/badge.svg)](https://github.com/Dalizi2026/OpenCodeGoChecker/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+**➡️ [点这里下载最新的 `OpenCodeGoChecker.exe`](https://github.com/Dalizi2026/OpenCodeGoChecker/releases/latest)** —— 单文件、双击即用、不用装 Python。
+
+---
+
 一个 Windows 桌面小工具，把你在各家 AI 编程订阅里的**额度窗口**和**本机 token 消耗**汇总到一个界面里。
 
 - **云端额度**：OpenCode Go（opencode zen）、Command Code、Cline Pass、阶跃星辰 StepFun、Grok Build
@@ -15,7 +23,7 @@
 
 ### 方式一：下载现成的 exe（推荐给普通用户）
 
-到 [Releases](../../releases) 下载 `OpenCodeGoChecker.exe`，双击运行。
+到 **[Releases](https://github.com/Dalizi2026/OpenCodeGoChecker/releases/latest)** 下载 `OpenCodeGoChecker.exe`，双击运行。
 
 **运行要求**：Windows 10/11。需要 [Microsoft Edge WebView2 运行时](https://developer.microsoft.com/microsoft-edge/webview2/)（Windows 11 自带；Windows 10 若提示缺少，装一次即可）。
 
@@ -24,7 +32,7 @@
 ### 方式二：从源码运行
 
 ```bat
-git clone <this-repo>
+git clone https://github.com/Dalizi2026/OpenCodeGoChecker.git
 cd OpenCodeGoChecker
 pip install -r requirements.txt
 python opencode_go_checker.py
