@@ -815,7 +815,40 @@ def _dsh_home_score(p):
     return score
 
 def dsh_home():
-    """实际存在的 DSH 数据目录；优先返回真正含有账本/凭据的那个。"""
+    """实际使用的 DSH 数据目录。
+
+    优先级规则（重要）：
+      1) 用户**显式指定**的目录（设置页填的，或 DSH_HOME / DSH_DATA_DIR 环境变量）
+         —— 只要里面确实有账本或凭据，就无条件采用，绝不被其它目录「打分盖过」；
+      2) 否则在全部候选里挑「最像数据目录」的那个（有 ledger.json 得 2 分，
+         有 .credentials.yaml / profiles / settings.yaml 各得 1 分）。
+
+    第 2 条是为了解决一台机器上同时存在旧 CLI 的空壳 ~/.dsh 和 desktop 真实数据
+    目录时挑错地方的问题；但它不能反过来压过用户的显式指定。
+    """
+    explicit = []
+    p = _cfg_path("dsh_home")
+    if p:
+        explicit.append(p)
+    for env in ("DSH_HOME", "DSH_DATA_DIR"):
+        v = os.getenv(env)
+        if v:
+            explicit.append(Path(v))
+    v = os.getenv("DSH_PROFILE_DIR")
+    if v:
+        try:
+            pp = Path(v)
+            if pp.parent.name == "profiles":
+                explicit.append(pp.parent.parent)
+        except Exception:
+            pass
+    for p in explicit:
+        try:
+            if p.exists() and _dsh_home_score(p) > 0:
+                return p
+        except Exception:
+            pass
+
     cands = _dsh_home_candidates()
     existing = []
     for p in cands:
