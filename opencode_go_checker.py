@@ -3855,6 +3855,77 @@ __TAILWIND_SCRIPT_INLINE__
     background: transparent; color: #94a3b8; display: inline-flex; align-items: center; justify-content: center;
     transition: all 0.15s ease;
   }
+
+  /* ---------- 设置页：数据源路径面板 ----------
+     旧版是「状态 + 名称 + 路径」三列挤在一行，长路径撑破 .modal-card
+     （它 overflow:hidden）后被直接裁掉，用户看不到完整路径。
+     现在路径单独占一行并允许任意位置换行，父容器再兜一层 overflow-x:hidden，
+     从结构上不可能横向溢出。
+     配色一律走主题变量，四个主题下都不会出现「白盒子」。
+     提示条用半透明色，明暗主题都成立。 */
+  .paths-panel {
+    border: 1px solid var(--border-subtle); border-radius: 8px;
+    background: var(--bg-card-subtle);
+    padding: 0 11px; overflow-x: hidden;
+  }
+  .path-row { padding: 7px 0; border-top: 1px solid var(--border-subtle); min-width: 0; }
+  .path-row:first-child { border-top: none; }
+  .path-row-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .path-dot { width: 6px; height: 6px; border-radius: 50%; flex: 0 0 auto; }
+  .path-name {
+    font-size: 11.5px; font-weight: 600; color: var(--text-body);
+    flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .path-badge {
+    font-size: 9.5px; font-weight: 600; padding: 1px 6px; border-radius: 999px;
+    border: 1px solid transparent; flex: 0 0 auto; letter-spacing: 0.2px;
+  }
+  .path-value {
+    margin-top: 3px; font-family: Consolas, "Cascadia Mono", monospace; font-size: 10.5px;
+    line-height: 1.55; color: var(--text-secondary);
+    overflow-wrap: anywhere; word-break: break-all; min-width: 0;
+  }
+  .paths-note {
+    display: flex; gap: 6px; align-items: flex-start;
+    padding: 7px 9px; border-radius: 7px; font-size: 11px; line-height: 1.55; margin: 8px 0 0;
+  }
+  .paths-note .ico { flex: 0 0 auto; line-height: 1.4; }
+  .paths-note b { font-weight: 700; }
+  .paths-note.warn {
+    background: rgba(245, 158, 11, 0.10); border: 1px solid rgba(245, 158, 11, 0.34);
+    color: var(--accent-amber);
+  }
+  .paths-note.ok {
+    background: rgba(34, 197, 94, 0.10); border: 1px solid rgba(34, 197, 94, 0.32);
+    color: var(--accent-green);
+  }
+  .paths-note.muted {
+    background: var(--bg-card-subtle); border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+  }
+  .paths-note code {
+    font-family: Consolas, "Cascadia Mono", monospace; overflow-wrap: anywhere;
+    background: rgba(127, 127, 127, 0.14); padding: 0 3px; border-radius: 3px;
+  }
+
+  /* 设置页分区标题 */
+  .settings-section-title {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 11px; font-weight: 700; color: var(--text-secondary);
+    letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 2px;
+  }
+  .settings-section-title::after {
+    content: ''; flex: 1 1 auto; height: 1px; background: var(--border-subtle);
+  }
+  /* 设置页内容较高时自身可滚动，避免超出窗口 */
+  .modal-body-scroll { max-height: calc(100vh - 150px); overflow-y: auto; overflow-x: hidden; }
+  .field-label { display: block; font-size: 11px; color: var(--text-secondary); margin-bottom: 4px; }
+  .field-help { font-size: 10.5px; color: var(--text-muted); margin-top: 4px; line-height: 1.5; }
+  .field-help code {
+    font-family: Consolas, "Cascadia Mono", monospace;
+    background: rgba(127, 127, 127, 0.14); padding: 0 3px; border-radius: 3px;
+    overflow-wrap: anywhere;
+  }
   .modal-x:hover { background: #f1f5f9; color: #475569; }
   .modal-body { padding: 16px 18px 4px; display: flex; flex-direction: column; gap: 13px; }
   .modal-label {
@@ -6987,13 +7058,17 @@ function openSettingsModal() {
 /* ---------- 数据源路径面板 ---------- */
 function _pathRow(label, obj) {
     if (!obj) return '';
-    const ok = obj.found;
+    const ok = !!obj.found;
     const color = ok ? '#22c55e' : '#f43f5e';
-    const mark = ok ? '✓ 已找到' : '✕ 未找到';
-    return `<div style="display:flex;gap:6px;align-items:baseline;">
-      <span style="color:${color};flex-shrink:0;">${mark}</span>
-      <span style="color:#94a3b8;flex-shrink:0;">${esc(label)}</span>
-      <span style="font-family:Consolas,monospace;font-size:10.5px;color:#cbd5e1;word-break:break-all;">${esc(obj.path || '(未知)')}</span>
+    const badge = ok ? '已找到' : '未找到';
+    const path = obj.path || '(未知)';
+    return `<div class="path-row">
+      <div class="path-row-head">
+        <span class="path-dot" style="background:${color};"></span>
+        <span class="path-name">${esc(label)}</span>
+        <span class="path-badge" style="color:${color};background:${color}14;border-color:${color}33;">${badge}</span>
+      </div>
+      <div class="path-value" title="${esc(path)}">${esc(path)}</div>
     </div>`;
 }
 
@@ -7002,20 +7077,24 @@ function renderPathsPanel() {
     const box = document.getElementById('paths-status');
     if (box) {
         const cm = p.cost_meter || {};
-        const cmRow = cm.installed
-            ? `<div style="color:#22c55e;">✓ dsh-cost-meter 插件已安装（按日费用精确）</div>`
-            : `<div style="color:#f59e0b;">⚠ 未检测到 dsh-cost-meter 插件 —— 将回退到 dsh 会话缓存统计：`
-              + `合计准确，但「按日」以会话创建日归属，跨天会话会整段计入创建日</div>`;
+        const notes = [];
+        notes.push(cm.installed
+            ? `<div class="paths-note ok"><span class="ico">✓</span><span>已安装 dsh-cost-meter 插件，按日费用取自精确账本。</span></div>`
+            : `<div class="paths-note warn"><span class="ico">⚠</span><span>未检测到 dsh-cost-meter 插件，将回退到 dsh 会话缓存统计：<b>合计准确</b>，但「按日」以会话创建日归属，跨天会话会整段计入创建日。</span></div>`);
+        if (p.dsh_home_warning) {
+            notes.push(`<div class="paths-note warn"><span class="ico">⚠</span><span>${esc(p.dsh_home_warning)}</span></div>`);
+        }
         box.innerHTML =
-            cmRow +
-            (p.dsh_home_warning
-                ? `<div style="color:#f59e0b;">⚠ ${esc(p.dsh_home_warning)}</div>`
-                : '') +
-            _pathRow('DSH 账本', p.dsh_ledger) +
-            _pathRow('会话缓存', p.session_cache) +
-            _pathRow('Grok 会话库', p.grok_home) +
-            _pathRow('opencode 库', p.opencode_db) +
-            (p.env_dsh_home ? `<div style="color:#64748b;font-size:10.5px;">环境变量 DSH_HOME = ${esc(p.env_dsh_home)}</div>` : '');
+            `<div class="paths-panel">` +
+                _pathRow('DSH 账本', p.dsh_ledger) +
+                _pathRow('会话缓存', p.session_cache) +
+                _pathRow('Grok 会话库', p.grok_home) +
+                _pathRow('opencode 库', p.opencode_db) +
+            `</div>` +
+            notes.join('') +
+            (p.env_dsh_home
+                ? `<div class="paths-note muted"><span class="ico">ℹ</span><span>环境变量 DSH_HOME = <code style="font-family:Consolas,monospace;overflow-wrap:anywhere;">${esc(p.env_dsh_home)}</code></span></div>`
+                : '');
     }
     const set = (id, v) => { const el = document.getElementById(id); if (el && !el.value) el.value = v || ''; };
     set('path-dsh-home', (p.dsh_home || {}).override);
@@ -7398,7 +7477,7 @@ if (window.pywebview && window.pywebview.api) {
 
   <!-- ============ 模态：系统与主题设置 ============ -->
   <div id="modal-settings" class="modal-backdrop" onclick="if(event.target===this) closeModal('modal-settings')">
-    <div class="modal-card" style="width:480px; max-width:92vw;">
+    <div class="modal-card" style="width:540px; max-width:94vw;">
       <div class="modal-header">
         <div class="flex items-center gap-2">
           <div class="w-6 h-6 rounded-md bg-blue-50 text-blue-600 flex items-center justify-center">
@@ -7410,11 +7489,9 @@ if (window.pywebview && window.pywebview.api) {
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
         </button>
       </div>
-      <div class="modal-body">
-        <div style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px;">
-          选择您心仪的主题风格，界面色彩与高明度护眼配色即时生效，并自动保存您的配置：
-        </div>
-        <div class="grid grid-cols-2 gap-3 mb-2">
+      <div class="modal-body modal-body-scroll">
+        <div class="settings-section-title">界面主题</div>
+        <div class="grid grid-cols-2 gap-3">
           <!-- 风格 1：黑曜极客暗黑 -->
           <div id="theme-opt-obsidian" class="theme-select-card cursor-pointer border rounded-lg p-2.5 transition relative" onclick="selectAppTheme('obsidian')" style="background:#090d16; border-color:#1e293b;">
             <div class="flex items-center justify-between mb-1.5">
@@ -7471,27 +7548,34 @@ if (window.pywebview && window.pywebview.api) {
             <div style="font-size:10.5px;color:#9d95c4;">深邃夜空微紫 · 皓月白字 · 冰蓝天青</div>
           </div>
         </div>
-      </div>
 
-      <!-- ===== 数据源路径：别人的电脑上 dsh / grok / opencode 位置都不一样 ===== -->
-      <div class="mb-4">
-        <div class="modal-label">数据源路径</div>
-        <div style="font-size:11px;color:#94a3b8;margin:-2px 0 8px;">
-          留空 = 自动探测。本机用量来自这些目录，路径不对时对应面板会显示 0。
+        <!-- ===== 数据源路径：别人的电脑上 dsh / grok / opencode 位置都不一样 ===== -->
+        <div class="settings-section-title">数据源路径</div>
+        <div class="field-help" style="margin:2px 0 9px;">
+          留空 = 自动探测。本机用量来自下面这些目录，路径不对时对应面板会显示 0。
         </div>
-        <div id="paths-status" style="font-size:11.5px;line-height:1.9;margin-bottom:8px;"></div>
+        <div id="paths-status"></div>
 
-        <label style="font-size:11px;color:#94a3b8;">DSH 数据目录（含 storages/cost-meter/ledger.json）</label>
-        <input id="path-dsh-home" class="modal-input" type="text" placeholder="例如 D:\\DeepSeekHarness\\data 或 ~/.dsh" style="margin-bottom:6px;">
+        <div style="margin-top:11px;">
+          <label class="field-label" for="path-dsh-home">DSH 数据目录</label>
+          <input id="path-dsh-home" class="modal-input" type="text" placeholder="例如 D:\\DeepSeekHarness\\data 或 ~/.dsh">
+          <div class="field-help">该目录下应有 <code>storages/cost-meter/ledger.json</code>（装了费用插件）或 <code>storages/session_projcache/</code>（没装插件时用它统计）。</div>
+        </div>
 
-        <label style="font-size:11px;color:#94a3b8;">Grok 数据目录（含 sessions/ 或 auth.json）</label>
-        <input id="path-grok-home" class="modal-input" type="text" placeholder="例如 ~/.grok" style="margin-bottom:6px;">
+        <div style="margin-top:11px;">
+          <label class="field-label" for="path-grok-home">Grok 数据目录</label>
+          <input id="path-grok-home" class="modal-input" type="text" placeholder="例如 ~/.grok">
+          <div class="field-help">该目录下应有 <code>sessions/</code> 或 <code>auth.json</code>。</div>
+        </div>
 
-        <label style="font-size:11px;color:#94a3b8;">opencode 本地库 opencode.db 完整路径</label>
-        <input id="path-opencode-db" class="modal-input" type="text" placeholder="例如 D:\\OpenCodeData\\opencode.db" style="margin-bottom:8px;">
+        <div style="margin-top:11px;">
+          <label class="field-label" for="path-opencode-db">opencode 本地库完整路径</label>
+          <input id="path-opencode-db" class="modal-input" type="text" placeholder="例如 D:\\OpenCodeData\\opencode.db">
+          <div class="field-help">填到 <code>opencode.db</code> 文件本身，不是它所在的文件夹。</div>
+        </div>
 
-        <div style="display:flex;gap:8px;">
-          <button class="btn-action btn-action-secondary" style="flex:1;justify-content:center;padding:8px 0;" onclick="saveDataPaths()">保存路径</button>
+        <div style="display:flex;gap:8px;margin-top:12px;">
+          <button class="btn-action btn-action-primary" style="flex:1;justify-content:center;padding:8px 0;" onclick="saveDataPaths()">保存路径</button>
           <button class="btn-action btn-action-secondary" style="flex:1;justify-content:center;padding:8px 0;" onclick="autoDetectPaths()">重新自动探测</button>
         </div>
       </div>
