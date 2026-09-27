@@ -33,6 +33,12 @@ SENSITIVE_NAMES = [
     "settings.yaml",
 ]
 SENSITIVE_SUFFIX = (".bak", ".tmp", ".corrupt", ".log")
+# 程序「导出备份」时下载的文件名（用户可能顺手存进仓库再 commit）
+SENSITIVE_PATTERNS = [
+    re.compile(r"^opencode_keys_backup_.*\.json$"),
+    re.compile(r".*_keys_backup_.*\.json$"),
+    re.compile(r"^opencode_go_keys.*\.json$"),
+]
 # 允许存在的同名文件（仓库里本来就该有的）
 ALLOWLIST_PATHS = set()
 
@@ -87,7 +93,8 @@ def scan():
         name = os.path.basename(path).lower()
 
         # 1. 文件名
-        if name in SENSITIVE_NAMES or name.endswith(SENSITIVE_SUFFIX):
+        if (name in SENSITIVE_NAMES or name.endswith(SENSITIVE_SUFFIX)
+                or any(p.match(name) for p in SENSITIVE_PATTERNS)):
             findings.append(("文件名", r, "疑似密钥/运行数据文件，不应进入仓库"))
             continue
 
@@ -147,7 +154,8 @@ def main():
         print("git 已跟踪 %d 个文件" % len(tracked))
         bad = [t for t in tracked
                if os.path.basename(t).lower() in SENSITIVE_NAMES
-               or os.path.basename(t).lower().endswith(SENSITIVE_SUFFIX)]
+               or os.path.basename(t).lower().endswith(SENSITIVE_SUFFIX)
+               or any(p.match(os.path.basename(t).lower()) for p in SENSITIVE_PATTERNS)]
         for t in bad:
             findings.append(("git 跟踪", t, "敏感文件已被 git 跟踪，必须 git rm --cached"))
 

@@ -50,28 +50,58 @@ def _finite(v):
     return f if math.isfinite(f) else None
 
 
-def _json_safe(obj, _depth=0):
+def _json_safe(obj, _depth=0, _seen=None):
     """递归净化：非有限浮点 → None，并把不可序列化的对象降级成字符串。
 
     所有 js_api 的返回值都必须先过这里，否则可能永久卡死前端。
+
+    实现要点：
+      · 用 id() 去重，避免自引用结构（a=[a,a]）在深度上限内指数爆炸 ——
+        只靠深度上限的话，扇出 ≥2 的环会让调用方假死十几秒。
+      · 兜底 str() 也必须包在 try 里：__repr__ 抛异常的对象会直接把异常
+        抛出本函数。
     """
+    if _seen is None:
+        _seen = set()
     if _depth > 24:
         return None
     if obj is None or isinstance(obj, (str, bool, int)):
         return obj
     if isinstance(obj, float):
         return obj if math.isfinite(obj) else None
+    oid = id(obj)
+    if oid in _seen:
+        return None                      # 环状引用
     if isinstance(obj, dict):
-        return {str(k): _json_safe(v, _depth + 1) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [_json_safe(v, _depth + 1) for v in obj]
-    if isinstance(obj, (datetime,)):
+        _seen.add(oid)
+        try:
+            out = {}
+            for k, v in obj.items():
+                try:
+                    kk = k if isinstance(k, str) else str(k)
+                except Exception:
+                    kk = repr(type(k))
+                out[kk] = _json_safe(v, _depth + 1, _seen)
+            return out
+        finally:
+            _seen.discard(oid)
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        _seen.add(oid)
+        try:
+            return [_json_safe(v, _depth + 1, _seen) for v in obj]
+        finally:
+            _seen.discard(oid)
+    if isinstance(obj, datetime):
         return obj.strftime("%Y-%m-%d %H:%M:%S")
     try:
         json.dumps(obj)
         return obj
     except Exception:
+        pass
+    try:
         return str(obj)
+    except Exception:
+        return "<unrepresentable %s>" % type(obj).__name__
 
 
 def _safe_json_loads(text):
@@ -183,6 +213,7 @@ CLINE_COST_DIVISOR = 1_000_000
 CLINE_PAGE_LIMIT = 200
 CLINE_MAX_PAGES = 12
 _CLINE_USAGE_CACHE = {"at": 0.0, "uid": "", "time_key": "", "data": None, "warn": ""}
+_CLINE_CACHE_LOCK = threading.RLock()
 
 # ---------- StepFun Step Plan ----------
 # 月池档位（M Credit / 月）
@@ -340,6 +371,7 @@ SETTINGS_FILE = STORAGE_DIR / "app_settings.json"
 LOG_FILE = STORAGE_DIR / "startup.log"
 
 _KEYS_LOCK = threading.RLock()
+_MUTATE_LOCK = threading.RLock()
 _LAST_SAVE_ERROR = [""]
 
 def log_line(msg):
@@ -479,13 +511,14 @@ def save_keys(keys):
 def mask_key(k):
     """掩码显示。短 Key 不再暴露首尾片段（旧实现会把 9~12 位的 Key 露出 8 位）。"""
     k = (k or "").strip()
-    if not k:
+    n = len(k)
+    if n == 0:
         return ""
-    if len(k) <= 8:
-        return "•" * len(k)
-    head = k[:4] if len(k) >= 16 else k[:2]
-    tail = k[-4:] if len(k) >= 16 else k[-2:]
-    return head + " ··· " + tail
+    if n < 12:
+        return "•" * n
+    if n >= 20:
+        return k[:4] + "·" * 6 + k[-4:]
+    return k[:3] + "·" * 6 + k[-3:]
 
 def format_reset(sec):
     try: sec=int(sec)
@@ -579,7 +612,9 @@ def get_opencode_db_path():
     cands = []
     p = _cfg_path("opencode_db")
     if p:
-        cands.append(p if p.suffix.lower() == ".db" else p / "opencode.db")
+        # 用户显式指定就认它，**哪怕文件当前不存在** —— 否则「我填了路径却还是
+        # 读别的库」无法解释。设置页会把它显示成「✕ 未找到」，便于发现写错。
+        return p if p.suffix.lower() == ".db" else p / "opencode.db"
     for env in ("OPENCODE_DATA", "OPENCODE_HOME", "XDG_DATA_HOME"):
         v = os.getenv(env)
         if v:
@@ -801,11 +836,13 @@ def _dsh_home_candidates():
 def _dsh_home_score(p):
     """目录「像不像」真的 DSH 数据目录。
 
-    有账本 2 分（最权威）；有凭据 / profiles / settings.yaml / 会话缓存 各 1 分。
-    会话缓存必须计分：没装 cost-meter 插件的机器上，一个 dsh home 可能**只有**
+    有账本 2 分（最权威）；有凭据 / profiles / settings.yaml / **非空的**会话缓存 各 1 分。
+    会话缓存必须计分：没装 cost-meter 插件的机器上，一个 dsh home 可能只有
     storages/session_projcache —— 不计分的话它得 0 分，dsh_home() 的「显式指定」
     分支会把它当成无效目录跳过，于是用户明明填了路径，程序却去读机器上另一个
     dsh 目录的数据。
+    但**空目录不算**：否则一个刚建好的空壳 session_projcache 会把真正有账本的
+    目录挤掉（实测边界场景）。
     """
     score = 0
     try:
@@ -817,13 +854,47 @@ def _dsh_home_score(p):
             score += 1
         if (p / "settings.yaml").exists():
             score += 1
-        if (p / "storages" / "session_projcache").exists():
+        sc = p / "storages" / "session_projcache"
+        agg = p / "storages" / "session_projcache.json"
+        if sc.is_dir() and next(sc.glob("sessions/*.json"), None) is not None:
             score += 1
-        elif (p / "storages" / "session_projcache.json").exists():
+        elif agg.is_file() and agg.stat().st_size > 64:
             score += 1
     except Exception:
         pass
     return score
+
+def _has_ledger(p):
+    try:
+        return (p / "storages" / "cost-meter" / "ledger.json").exists()
+    except Exception:
+        return False
+
+def _dsh_explicit_homes():
+    """用户**显式**指定的 dsh 目录（设置页 / 环境变量）。"""
+    out = []
+    p = _cfg_path("dsh_home")
+    if p:
+        out.append(p)
+    for env in ("DSH_HOME", "DSH_DATA_DIR"):
+        v = os.getenv(env)
+        if v:
+            out.append(Path(v))
+    v = os.getenv("DSH_PROFILE_DIR")
+    if v:
+        try:
+            pp = Path(v)
+            if pp.parent.name == "profiles":
+                out.append(pp.parent.parent)
+        except Exception:
+            pass
+    seen, uniq = set(), []
+    for p in out:
+        k = str(p).lower()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(p)
+    return uniq
 
 def dsh_home():
     """实际使用的 DSH 数据目录。
@@ -837,22 +908,7 @@ def dsh_home():
     第 2 条是为了解决一台机器上同时存在旧 CLI 的空壳 ~/.dsh 和 desktop 真实数据
     目录时挑错地方的问题；但它不能反过来压过用户的显式指定。
     """
-    explicit = []
-    p = _cfg_path("dsh_home")
-    if p:
-        explicit.append(p)
-    for env in ("DSH_HOME", "DSH_DATA_DIR"):
-        v = os.getenv(env)
-        if v:
-            explicit.append(Path(v))
-    v = os.getenv("DSH_PROFILE_DIR")
-    if v:
-        try:
-            pp = Path(v)
-            if pp.parent.name == "profiles":
-                explicit.append(pp.parent.parent)
-        except Exception:
-            pass
+    explicit = _dsh_explicit_homes()
     for p in explicit:
         try:
             if p.exists() and _dsh_home_score(p) > 0:
@@ -870,12 +926,36 @@ def dsh_home():
             pass
     if not existing:
         return cands[0]
-    best, best_score = existing[0], -1
+    # 分数相同时，**有账本的目录赢** —— 否则同分的诱饵目录（凭据+profiles+
+    # settings.yaml = 3 分）只因为候选顺序靠前就会胜出，而它的账本根本不存在。
+    best, best_score, best_ledger = existing[0], -1, False
     for p in existing:
         s = _dsh_home_score(p)
-        if s > best_score:
-            best, best_score = p, s
+        has = _has_ledger(p)
+        if s > best_score or (s == best_score and has and not best_ledger):
+            best, best_score, best_ledger = p, s, has
     return best
+
+def dsh_home_warning():
+    """显式指定的 dsh 目录被忽略时，给一句人话说明。
+
+    没有这句，用户会看到「设置里明明填了路径，面板却显示别的目录的数据」，
+    而且完全不知道为什么 —— 实测边界场景。
+    """
+    try:
+        chosen = dsh_home()
+    except Exception:
+        return ""
+    for p in _dsh_explicit_homes():
+        try:
+            if p.exists() and p != chosen:
+                return ("你指定的 dsh 目录 %s 里没有账本 / 凭据 / 非空会话缓存，"
+                        "已改用 %s。若前者才是你的数据目录，请确认它下面有 "
+                        "storages/cost-meter/ledger.json 或 .credentials.yaml。"
+                        % (p, chosen))
+        except Exception:
+            continue
+    return ""
 
 def dsh_ledger_path():
     """账本 = <dsh_home()>/storages/cost-meter/ledger.json。
@@ -904,8 +984,13 @@ def _dsh_provider_config_paths():
     只读「当前活动 profile」优先，并跳过备份/归档目录：历史版本会把所有 profile
     目录（含 desktop-backup-* 快照）一起读进来，再按字母序 setdefault 取第一个，
     结果可能用几个月前的旧配置去解析你的 Key。
+
+    **只从 dsh_home() 选中的那个数据目录里读**：旧实现遍历全部候选目录，会把机器上
+    其它 dsh 安装（旧 CLI 残留、另一个 desktop 数据目录）的 profile 一起合并进来，
+    那些安装独有的 provider id 可能混进 keymap，把 Key 映射到错误的 provider。
     """
-    out = [dsh_home() / "settings.yaml"]
+    home = dsh_home()
+    out = [home / "settings.yaml"]
     active = os.getenv("DSH_PROFILE_DIR")
     active_name = ""
     if active:
@@ -916,11 +1001,9 @@ def _dsh_provider_config_paths():
         except Exception:
             pass
     skip_words = ("backup", "bak", "old", "archive", "retired", "tmp", "test")
-    for base in _dsh_home_candidates():
-        prof = base / "profiles"
-        try:
-            if not prof.exists():
-                continue
+    prof = home / "profiles"
+    try:
+        if prof.exists():
             dirs = [d for d in sorted(prof.iterdir()) if d.is_dir()]
             dirs.sort(key=lambda d: (0 if d.name == active_name else 1, d.name))
             for d in dirs:
@@ -935,8 +1018,8 @@ def _dsh_provider_config_paths():
                             out.append(f)
                     except Exception:
                         pass
-        except Exception:
-            pass
+    except Exception:
+        pass
     return out
 
 def _providers_from_yaml_doc(doc):
@@ -999,6 +1082,7 @@ def load_dsh_ledger(force=False, max_age=10.0):
 
 _KEYMAP_CACHE = {"map": None, "at": 0.0, "err": ""}
 _KEYMAP_TTL = 300.0
+_KEYMAP_LOCK = threading.RLock()
 
 _KEYMAP_BUILDING = [False]
 
@@ -1008,18 +1092,24 @@ def load_dsh_keymap(force=False):
 
     缓存带 TTL，且**失败不缓存** —— 旧实现把异常吞掉后把空表缓存一辈子，
     界面于是长期误报「该 Key 未在 dsh 配置中使用」。
+    并发：query_all 的每个 worker 都会经 providers_for_key 走到这里，必须加锁，
+    否则会重复解析 YAML 并争抢同一个 dict。
     """
     now = time.time()
-    if (not force and _KEYMAP_CACHE["map"] is not None
-            and (now - _KEYMAP_CACHE["at"]) < _KEYMAP_TTL):
-        return _KEYMAP_CACHE["map"]
+    with _KEYMAP_LOCK:
+        cached = _KEYMAP_CACHE["map"]
+        cached_at = _KEYMAP_CACHE["at"]
+    if (not force and cached is not None
+            and (now - cached_at) < _KEYMAP_TTL):
+        return cached
     if _KEYMAP_BUILDING[0]:
         # 防重入：构建过程中会读取账本/会话缓存，万一将来那条链路又绕回这里，
         # 直接返回空表，绝不允许无限递归。
         return {}
     _KEYMAP_BUILDING[0] = True
     try:
-        return _build_dsh_keymap(now)
+        with _KEYMAP_LOCK:
+            return _build_dsh_keymap(now)
     finally:
         _KEYMAP_BUILDING[0] = False
 
@@ -1134,8 +1224,10 @@ def _day_keys_for(days_keys, time_key, utc=True):
         return [k for k in ks if k.startswith(month_prefix)]
     n = {"近7天": 7, "近30天": 30}.get(tk)
     if n:
+        # 必须有上界：旧实现改成 k >= lo 之后，时钟偏移产生的「未来日」桶会被算进来
         lo = (now.date() - timedelta(days=n - 1)).strftime("%Y-%m-%d")
-        return [k for k in ks if k >= lo]
+        hi = now.strftime("%Y-%m-%d")
+        return [k for k in ks if lo <= k <= hi]
     return ks
 
 def _agg_by_provider_model(days, day_keys, providers=None):
@@ -1248,13 +1340,16 @@ def _expand_providers(days, providers):
 FX_DEFAULT = 6.6977          # 2026-09-20 当日汇率（离线兜底）
 FX_URL = "https://open.er-api.com/v6/latest/USD"
 _FX_MEM = {"fx": 0.0, "at": 0.0}
+_FX_LOCK = threading.RLock()
 
 def get_fx(force=False):
     """USD→CNY 汇率：实时接口（12 小时缓存）→ 本地缓存文件 → 默认值。
     汇率只影响费用的人民币折算显示，取不到不影响其他功能。"""
     now = time.time()
-    if not force and _FX_MEM["fx"] and (now - _FX_MEM["at"]) < 12 * 3600:
-        return _FX_MEM["fx"]
+    with _FX_LOCK:
+        mem = dict(_FX_MEM)
+    if not force and mem["fx"] and (now - mem["at"]) < 12 * 3600:
+        return mem["fx"]
     # 本地缓存文件
     cache_p = STORAGE_DIR / "fx_cache.json"
     try:
@@ -1265,7 +1360,8 @@ def get_fx(force=False):
                 fx = _safe_float(c.get("fx"))
                 if 5.0 < fx < 10.0:
                     # 继承缓存文件自身的写入时间，否则一个快过期的值会被续命成 12 小时
-                    _FX_MEM.update(fx=fx, at=_safe_float(c.get("at"), now))
+                    with _FX_LOCK:
+                        _FX_MEM.update(fx=fx, at=_safe_float(c.get("at"), now))
                     return fx
     except Exception:
         pass
@@ -1276,7 +1372,8 @@ def get_fx(force=False):
             j = _safe_json_loads(r.read().decode("utf-8", errors="ignore"))
         fx = _safe_float((j.get("rates") or {}).get("CNY")) if isinstance(j, dict) else 0.0
         if 5.0 < fx < 10.0:
-            _FX_MEM.update(fx=fx, at=now)
+            with _FX_LOCK:
+                _FX_MEM.update(fx=fx, at=now)
             try:
                 with open(cache_p, "w", encoding="utf-8") as f:
                     json.dump({"fx": fx, "at": now}, f)
@@ -1292,7 +1389,8 @@ def get_fx(force=False):
                 c = _safe_json_loads(f.read())
             fx = _safe_float(c.get("fx")) if isinstance(c, dict) else 0.0
             if 5.0 < fx < 10.0:
-                _FX_MEM.update(fx=fx, at=now)
+                with _FX_LOCK:
+                    _FX_MEM.update(fx=fx, at=now)
                 return fx
     except Exception:
         pass
@@ -1332,12 +1430,17 @@ def cost_meter_installed():
     return False
 
 def _session_day(created_at_ms):
-    """会话创建时间 → UTC 日期。用 UTC 是为了和账本的日桶口径保持一致。"""
+    """会话创建时间 → 日期键。
+
+    用**本地日期**：这样才和 dsh-cost-meter 账本的日键口径一致（插件用
+    localDayKey 本地字段）。旧实现用 UTC，会让「装了插件」和「没装插件」两种
+    情况下同一个 dsh 源的按日口径不一样。
+    """
     try:
         ts = _safe_float(created_at_ms) / 1000.0
         if ts <= 0:
             return ""
-        return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
     except Exception:
         return ""
 
@@ -1497,6 +1600,57 @@ def _ledger_days(data):
     return d if isinstance(d, dict) else {}
 
 
+def _ledger_day_convention(data):
+    """判定账本日键用的是**本地日期**还是 **UTC 日期**。
+
+    为什么必须判：写账本的 dsh-cost-meter 插件用的是 `localDayKey()`（`new Date()`
+    的本地字段，源码 store.js:275-279，注释明写「本地日期键(宿主机时区)」），所以
+    正常是本地口径。但历史数据可能被迁移/回填过，硬编码任何一种口径，在另一种
+    口径的账本上都会静默错数（「今日显示昨天」或「今日显示 0」）。
+
+    判定方法（用账本自证，不靠猜）：每天桶里存有当天的 `sessions[].at`（毫秒）。
+    看「当天最早那次会话」落在哪：
+      · 落在该日**本地**午夜后的头一小时 → 桶边界是本地午夜 → 本地口径；
+      · 落在该日 **UTC** 午夜后的头一小时（UTC+8 下即本地 08:00 前后）→ UTC 口径。
+    取票数多的一方；两边都没票时按插件源码的实际行为回落到「本地」。
+    """
+    days = _ledger_days(data)
+    if not days:
+        return "local"
+    local_votes = utc_votes = 0
+    for k, v in days.items():
+        if not isinstance(v, dict):
+            continue
+        ss = v.get("sessions")
+        if not isinstance(ss, list) or not ss:
+            continue
+        ats = []
+        for s in ss:
+            if isinstance(s, dict) and s.get("at"):
+                try:
+                    ats.append(float(s["at"]))
+                except Exception:
+                    pass
+        if not ats:
+            continue
+        try:
+            base = datetime.strptime(k, "%Y-%m-%d")
+        except Exception:
+            continue
+        first = min(ats) / 1000.0
+        # 本地午夜
+        loc_mid = base.timestamp()
+        # 该日的 UTC 午夜，换算成本地时间戳
+        utc_mid = base.replace(tzinfo=timezone.utc).timestamp()
+        if 0 <= (first - loc_mid) < 3600:
+            local_votes += 1
+        elif 0 <= (first - utc_mid) < 3600:
+            utc_votes += 1
+    if local_votes == 0 and utc_votes == 0:
+        return "local"
+    return "local" if local_votes >= utc_votes else "utc"
+
+
 def _load_dsh_any(force=False):
     """账本优先，不存在或读不出来则回退到会话缓存。
 
@@ -1536,7 +1690,10 @@ def dsh_usage(providers=None, time_key="全部", force=False):
                 "source": "dsh", "hint": warn,
                 "db": str(dsh_ledger_path()), "daily_series": []}
     days = _ledger_days(data)
-    day_keys = _day_keys_for(list(days.keys()), time_key)
+    # 日键口径由账本自身的时间戳判定（见 _ledger_day_convention），不再硬编码：
+    # dsh-cost-meter 用的是本地日期键，但历史账本可能被迁移过。
+    day_conv = _ledger_day_convention(data)
+    day_keys = _day_keys_for(list(days.keys()), time_key, utc=(day_conv == "utc"))
     if providers is not None and not providers:
         # 明确给了空列表 = 该 Key 未映射到任何 provider，结果必须为 0 而不是"全部"
         zero = {"sessions":0,"input":0,"output":0,"reasoning":0,"cacheRead":0,"cacheWrite":0,
@@ -1608,6 +1765,10 @@ def dsh_usage(providers=None, time_key="全部", force=False):
         out["hint"] = (str(out.get("hint")) + "；" + str(warn)) if out.get("hint") else str(warn)
     elif warn:
         out["error"] = warn
+    # 用户显式指定的目录被忽略时，必须说出来（否则「我填了路径却显示别的目录」无从解释）
+    _hw = dsh_home_warning()
+    if _hw:
+        out["hint"] = (str(out.get("hint")) + "；" + _hw) if out.get("hint") else _hw
     # 账本新鲜度：dsh-cost-meter 插件停跑时账本会「静默停更」——数字不会变，但看不出原因。
     # 这里显式提示最后记录日，避免把陈旧数据误当成实时数据。
     # （回退模式下不适用：会话缓存的按日归属本来就不是精确的，已在 hint 里说明。）
@@ -2039,7 +2200,8 @@ _CLINE_UID_CACHE = {"key": "", "uid": "", "at": 0.0}
 def cline_user_id(apikey, force=False):
     """取 Cline 用户 id（按天/逐条用量接口都需要它）。1 小时缓存。"""
     now = time.time()
-    c = _CLINE_UID_CACHE
+    with _CLINE_CACHE_LOCK:
+        c = dict(_CLINE_UID_CACHE)
     if (not force) and c["uid"] and c["key"] == apikey and (now - c["at"]) < 3600:
         return c["uid"]
     rec, _st = _cline_get(CLINE_BASE + CLINE_ME_PATH, apikey)
@@ -2047,7 +2209,8 @@ def cline_user_id(apikey, force=False):
     if isinstance(rec, dict) and isinstance(rec.get("data"), dict):
         uid = str(rec["data"].get("id") or "")
     if uid:
-        _CLINE_UID_CACHE.update(key=apikey, uid=uid, at=now)
+        with _CLINE_CACHE_LOCK:
+            _CLINE_UID_CACHE.update(key=apikey, uid=uid, at=now)
     return uid
 
 def fetch_cline_usage_daily(apikey, uid, start_date, end_date, timeout=15):
@@ -2070,10 +2233,31 @@ def fetch_cline_usage_daily(apikey, uid, start_date, end_date, timeout=15):
             })
     return rows, st
 
+def _cline_local_day(ts):
+    """Cline 官方 createdAt（UTC ISO 串）→ **本地**日期键。
+
+    官方接口按 UTC 给时间戳，但面板要和 dsh（本地日键）、Grok（本地日键）合并成
+    一张趋势图，三个源必须同口径；否则同一根柱子会把 dsh 的
+    「09-26 08:00 → 09-27 08:00」和 Cline 的「09-26 00:00 → 24:00」相加。
+    """
+    s = str(ts or "").strip()
+    if not s:
+        return ""
+    try:
+        s2 = s[:-1] + "+00:00" if s.endswith("Z") else s
+        dt = datetime.fromisoformat(s2)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%Y-%m-%d")
+    except Exception:
+        return s[:10]
+
+
 def fetch_cline_records(apikey, uid, max_pages=CLINE_MAX_PAGES, timeout=15):
     """官方逐条调用记录（每页 ≤200，nextToken 翻页，新→旧）。
-    含 promptTokens / completionTokens / cachedTokens / costUsd / createdAt，
-    足够还原「分模型 + 缓存明细 + 调用次数」的用量表。返回 (records, truncated)。"""
+    含 promptTokens / completionTokens / cachedTokens / costUsd / createdAt。
+    返回 (records, truncated, failed)：failed=True 表示翻页中途失败、合计不完整
+    （旧实现把「中途失败」和「翻到底」混为一谈，不完整数据被当成完整数据展示）。"""
     out, cursor, pages = [], None, 0
     failed = False
     while pages < max_pages:
@@ -2104,17 +2288,20 @@ def cline_usage_official(apikey, uid, time_key="全部", force=False, max_pages=
       · 含 cachedTokens 明细，所以缓存率列是真的。
     逐条接口每页上限 200 条，超过 CLINE_MAX_PAGES 页时标记 truncated。"""
     ck = _CLINE_USAGE_CACHE
-    # max_pages 也要进缓存键：否则一次窄窗口调用会把结果污染给默认调用
-    if (not force) and ck["data"] is not None and ck["uid"] == uid \
+    # max_pages 也要进缓存键：否则一次窄窗口调用会把结果污染给默认调用。
+    # 注意写入处也必须存 max_pages，否则这里永远拿不到匹配值、缓存永不命中。
+    with _CLINE_CACHE_LOCK:
+        hit = (not force) and ck["data"] is not None and ck["uid"] == uid \
             and ck["time_key"] == time_key and ck.get("max_pages") == max_pages \
-            and (time.time() - ck["at"]) < 60.0:
-        return copy.deepcopy(ck["data"])
+            and (time.time() - ck["at"]) < 60.0
+        cached = copy.deepcopy(ck["data"]) if hit else None
+    if hit:
+        return cached
 
-    recs, truncated = fetch_cline_records(apikey, uid, max_pages=max_pages)
+    recs, truncated, failed = fetch_cline_records(apikey, uid, max_pages=max_pages)
     daily = {}
     for r in recs:
-        ts = str(r.get("createdAt") or "")
-        day = ts[:10]
+        day = _cline_local_day(r.get("createdAt"))
         if not day:
             continue
         prompt = int(_cc_num(r.get("promptTokens")))
@@ -2136,7 +2323,7 @@ def cline_usage_official(apikey, uid, time_key="全部", force=False, max_pages=
               "cost": 0.0, "tokens": 0, "tokens_with_cache": 0, "fx": get_fx()}
     per = {}
     for r in recs:
-        if str(r.get("createdAt") or "")[:10] not in day_keys:
+        if _cline_local_day(r.get("createdAt")) not in day_keys:
             continue
         prompt = int(_cc_num(r.get("promptTokens")))
         cache = int(_cc_num(r.get("cachedTokens")))
@@ -2180,13 +2367,18 @@ def cline_usage_official(apikey, uid, time_key="全部", force=False, max_pages=
         "per_model": per_model, "totals": totals, "daily_series": daily_series,
         "error": None, "source": "cline-official", "db": "api.cline.bot/users/%s/usages" % uid,
         "days": len(day_keys),
-        "hint": ("官网口径（含所有客户端）；明细已取最近 %d 条%s"
-                 % (len(recs), "，更早的记录未纳入" if truncated else "")),
+        "hint": ("官网口径（含所有客户端）；明细已取最近 %d 条%s%s"
+                 % (len(recs),
+                    "，更早的记录未纳入" if truncated else "",
+                    "；⚠ 翻页中途失败，以上合计不完整" if failed else "")),
         "truncated": truncated,
+        "partial": bool(failed),
         "all_daily": [{"date": k, "tokens": v["tokens_with_cache"], "cost": round(v["cost"], 4), "calls": v["calls"]}
                       for k, v in sorted(daily.items())],
     }
-    _CLINE_USAGE_CACHE.update(at=time.time(), uid=uid, time_key=time_key, data=out)
+    with _CLINE_CACHE_LOCK:
+        _CLINE_USAGE_CACHE.update(at=time.time(), uid=uid, time_key=time_key,
+                                  max_pages=max_pages, data=out)
     return out
 
 # ---------- Grok Build 本地免密查询 ----------
@@ -2227,6 +2419,7 @@ def _grok_sessions_dir():
 
 GROK_SESSIONS_DIR = _grok_sessions_dir()
 _GROK_QUOTA_CACHE = {"at": 0.0, "data": None}
+_GROK_QUOTA_LOCK = threading.RLock()
 
 def fetch_grok_quota(force=False):
     """从 ~/.grok 获取 Grok Heavy/SuperGrok 官方周额度、使用百分比与重置倒计时。
@@ -2234,8 +2427,10 @@ def fetch_grok_quota(force=False):
     若 Token 过期则尝试使用 refresh_token 刷新；
     若网络不可用则自动读取 ~/.grok/logs/unified.jsonl 最近一次记录，百分之百高可用。"""
     now = time.time()
-    if not force and _GROK_QUOTA_CACHE["data"] and (now - _GROK_QUOTA_CACHE["at"]) < 60.0:
-        return _GROK_QUOTA_CACHE["data"]
+    with _GROK_QUOTA_LOCK:
+        qc = dict(_GROK_QUOTA_CACHE)
+    if not force and qc["data"] and (now - qc["at"]) < 60.0:
+        return qc["data"]
 
     home = grok_home()
     auth_file = home / "auth.json"
@@ -2363,22 +2558,25 @@ def fetch_grok_quota(force=False):
             "stale_hint": ("额度取自本机日志回退（%s），非实时接口：Grok 登录可能已失效，"
                            "请运行 `grok login` 重新登录" % log_ts[:19]) if src_kind == "log" else ""
         }
-        _GROK_QUOTA_CACHE["data"] = res_data
-        _GROK_QUOTA_CACHE["at"] = now
+        with _GROK_QUOTA_LOCK:
+            _GROK_QUOTA_CACHE["data"] = res_data
+            _GROK_QUOTA_CACHE["at"] = now
         return res_data
 
     # 失败：不返回上一次的「成功」结果冒充新数据；只回上次数据并明确标记为陈旧
     fallback = {"tier": tier, "success": False,
                 "error": "无法获取 Grok 额度：本机未找到 ~/.grok/auth.json，或登录已失效。"}
-    prev = _GROK_QUOTA_CACHE.get("data")
+    prev = qc.get("data")
     if isinstance(prev, dict) and prev.get("success"):
         stale = dict(prev)
         stale["stale"] = True
         stale["stale_hint"] = "本次刷新失败，以下为上次成功获取的额度（非实时）"
-        _GROK_QUOTA_CACHE["at"] = now
+        with _GROK_QUOTA_LOCK:
+            _GROK_QUOTA_CACHE["at"] = now
         return stale
-    _GROK_QUOTA_CACHE["data"] = fallback
-    _GROK_QUOTA_CACHE["at"] = now
+    with _GROK_QUOTA_LOCK:
+        _GROK_QUOTA_CACHE["data"] = fallback
+        _GROK_QUOTA_CACHE["at"] = now
     return fallback
 
 def _parse_iso_to_local_date(iso_str):
@@ -2714,7 +2912,10 @@ def _load_grok_data_locked(force, now):
         log_line("Grok 用量档案合并失败：%s" % e)
         _restored, _arc_sess, _arc_turns = 0, 0, 0
 
-    _GROK_CACHE.update({
+    # 整份替换而不是逐字段 update：读者要么看到旧的、要么看到新的，
+    # 不会读到「新 daily + 旧 turns」这种半成品（账本缓存用的是同一套做法）。
+    global _GROK_CACHE
+    _GROK_CACHE = {
         "at": now,
         "daily": daily,
         "turns": turns_list,
@@ -2723,7 +2924,7 @@ def _load_grok_data_locked(force, now):
         "archive_restored": _restored,
         "archive_sessions": _arc_sess,
         "archive_turns": _arc_turns
-    })
+    }
     return _GROK_CACHE
 
 def grok_usage(time_key="全部", force=False, fx=None):
@@ -2802,7 +3003,7 @@ def grok_usage(time_key="全部", force=False, fx=None):
                  "不含该账号在其它设备/客户端的用量；Grok 官方未提供用量接口，"
                  "额度请以卡片上的官方百分比为准" % int(gdata.get("sessions_count") or 0)),
         "last_active": gdata["last_active"],
-        "quota": _GROK_QUOTA_CACHE.get("data")
+        "quota": (dict(_GROK_QUOTA_CACHE) or {}).get("data")
     }
 
 def merge_usage(dsh, grok):
@@ -4183,6 +4384,9 @@ __TAILWIND_SCRIPT_INLINE__
         <button onclick="moveCurrentKey('down')" title="下移选中密钥" class="sidebar-action-btn">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="6 9 12 15 18 9"></polyline></svg>
         </button>
+        <button onclick="moveCurrentKey('top')" title="置顶选中密钥（移到同渠道最前）" class="sidebar-action-btn">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline><line x1="5" y1="21" x2="19" y2="21"></line></svg>
+        </button>
         <button onclick="openEditKeyModal()" title="编辑选中密钥" class="sidebar-action-btn">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path></svg>
         </button>
@@ -4535,6 +4739,7 @@ __TAILWIND_SCRIPT_INLINE__
 // Synchronously injected initial state from Python
 let appState = __INITIAL_STATE_JSON__;
 let currentKeyIndex = (appState && typeof appState.selected === 'number') ? appState.selected : 0;
+let _persistedSelectedIndex = currentKeyIndex;
 const DEFAULT_TIER_FALLBACK = 1600;   // 档位数据缺失时的兜底值
 
 /* ---------- 通用小工具 ---------- */
@@ -4550,10 +4755,11 @@ function esc(s) {
 /* Key 掩码：短 Key 不能暴露首尾片段（旧实现 14 位以内的 Key 会被完整显示）。 */
 function maskKey(k) {
     k = String(k == null ? '' : k);
-    if (!k) return '••••';
-    if (k.length <= 8) return '•'.repeat(k.length);
-    if (k.length < 16) return k.slice(0, 2) + '•'.repeat(k.length - 4) + k.slice(-2);
-    return k.slice(0, 4) + '••••••••' + k.slice(-4);
+    const n = k.length;
+    if (n === 0) return '••••';
+    if (n < 12) return '•'.repeat(n);
+    if (n >= 20) return k.slice(0, 4) + '······' + k.slice(-4);
+    return k.slice(0, 3) + '······' + k.slice(-3);
 }
 
 /* 把任意值格式化成有限数字，杜绝 NaN/Infinity 渲染到界面 */
@@ -4609,7 +4815,7 @@ function _getKeyQuotaIndicator(it) {
             const usedPct = quota.used_percent !== undefined ? parseFloat(quota.used_percent) : Math.max(0, 100 - parseFloat(quota.remaining_percent));
             const remPct = quota.remaining_percent !== undefined ? parseFloat(quota.remaining_percent) : Math.max(0, 100 - usedPct);
             pct = usedPct;
-            title = `${quota.tier || 'SuperGrok Heavy'} · 周额度已用: ${pct.toFixed(1)}% · 剩余: ${remPct.toFixed(1)}%`;
+            title = `${esc(quota.tier || 'SuperGrok Heavy')} · 周额度已用: ${pct.toFixed(1)}% · 剩余: ${remPct.toFixed(1)}%`;
         } else {
             const weekTok = (res.week && res.week.tokens) || (res.total && res.total.tokens) || 0;
             const weekTokStr = weekTok >= 1e9 ? ((weekTok/1e9).toFixed(1) + 'B') : ((weekTok/1e6).toFixed(0) + 'M');
@@ -4630,10 +4836,10 @@ function _getKeyQuotaIndicator(it) {
         pct = (fPct !== null && fPct >= 70 && fPct > (wPct || 0)) ? fPct : (wPct !== null ? wPct : (fPct !== null ? fPct : (mPct !== null ? mPct : 0)));
         const state = plan.active ? (plan.canceledAt ? '已取消(到期前可用)' : '生效中') : '未生效';
         const fmt = (v) => (v === null || isNaN(v)) ? '--' : (v.toFixed(1) + '%');
-        title = `${plan.name || 'Cline Pass'} · ${state} · 5h: ${fmt(fPct)} · 周: ${fmt(wPct)} · 月: ${fmt(mPct)}`;
+        title = `${esc(plan.name || 'Cline Pass')} · ${state} · 5h: ${fmt(fPct)} · 周: ${fmt(wPct)} · 月: ${fmt(mPct)}`;
         if (all.length === 0) {
             return {
-                rightHtml: `<span class="font-mono text-[10.5px] text-slate-400" title="${title}">额度未知</span>`,
+                rightHtml: `<span class="font-mono text-[10.5px] text-slate-400" title="${esc(title)}">额度未知</span>`,
                 bottomTrack: ''
             };
         }
@@ -4651,6 +4857,8 @@ function _getKeyQuotaIndicator(it) {
         title = `OpenCode Go · 周窗口: ${pWeek.toFixed(1)}% · 5h: ${pRoll.toFixed(1)}% · 月窗口: ${pMonth.toFixed(1)}%`;
     }
 
+    // title 会进 innerHTML 的属性位，必须转义（title 里含 plan.name / quota.tier 等外部字符串）
+    title = esc(title);
     let statusCls = 'normal';
     let barClass = '';
 
@@ -4823,7 +5031,7 @@ function renderKeyList() {
                     <span class="badge badge-go">${esc(it.channel || '未知')}</span>
                 </div>
                 <div class="flex items-center justify-between">
-                    <span class="key-mask text-[11px] font-mono tracking-tight text-slate-400">${mask}</span>
+                    <span class="key-mask text-[11px] font-mono tracking-tight text-slate-400">${esc(mask)}</span>
                     ${qInfo.rightHtml}
                 </div>
                 ${qInfo.bottomTrack}
@@ -4855,6 +5063,11 @@ function selectKey(idx) {
         idx = 0;
     }
     currentKeyIndex = idx;
+    // 记住选中项，重启后恢复（旧版 set_selected 接口存在但前端从未调用）
+    if (idx !== _persistedSelectedIndex) {
+        _persistedSelectedIndex = idx;
+        if (window.pywebview && window.pywebview.api) apiCall('set_selected', [idx], 10000);
+    }
     document.querySelectorAll('.key-item').forEach(el => {
         const kIdx = parseInt(el.getAttribute('data-key-index'), 10);
         if (kIdx === idx) {
@@ -5112,7 +5325,8 @@ function renderStepFun(data, item) {
 
     document.getElementById('hero-status-pill').className = 'inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-amber-50 text-amber-700 border border-amber-200';
     const stepHint = data.hint || est.hint || (data.today && data.today.hint) || '';
-    document.getElementById('hero-status-pill').innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-amber-500"></span> 本地估算中 · ' + (est.month || '') + (stepHint ? ' · ' + stepHint : '');
+    // stepHint 可能来自远端接口的错误原文，必须转义后再进 innerHTML
+    document.getElementById('hero-status-pill').innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-amber-500"></span> 本地估算中 · ' + esc(est.month || '') + (stepHint ? ' · ' + esc(stepHint) : '');
     if (stepHint) {
         document.getElementById('c1-used').innerText = stepHint;
     }
@@ -5188,7 +5402,8 @@ function renderCommandCode(data, item) {
         pillText += ' · 异常: ' + data.failures.join(';');
     }
     pill.title = pillText;
-    pill.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0"></span> <span class="truncate">' + pillText + '</span>';
+    // acc.name 来自 whoami、data.failures 是远端报错原文 —— 都进 innerHTML，必须转义
+    pill.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0"></span> <span class="truncate">' + esc(pillText) + '</span>';
 }
 
 /* ================= Cline Pass 渲染 ================= */
@@ -5285,7 +5500,8 @@ function renderCline(data, item) {
         + ` · 官网口径（含所有客户端，含缓存）`
         + ` · 本期 ${periodLabel} ${fmtTok(uPeriod.tokens || 0)} tokens / $${(uPeriod.cost || 0).toFixed(2)}`
         + (uModels.length ? (' · 分模型: ' + uModels.map(m => `${m.model} ${fmtTok(m.tokens)}`).join(' / ')) : '');
-    pill.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-indigo-500 shrink-0"></span> <span class="truncate">' + txt + '</span>';
+    // txt 含 plan.name（远端）与 data.hint（远端 failures 原文）—— 必须转义
+    pill.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-indigo-500 shrink-0"></span> <span class="truncate">' + esc(txt) + '</span>';
 }
 
 /* ================= Grok Build 渲染 ================= */
@@ -5338,7 +5554,7 @@ function renderGrokBuild(data, item) {
             document.getElementById('c2-reset').title = `今日共执行 ${tCalls} 次模型调用`;
         } else {
             document.getElementById('c2-reset').innerText = lastActStr ? `最近活动 ${lastActStr}` : '今日暂无请求';
-            document.getElementById('c2-reset').title = lastActStr ? `今日暂无新请求。上次会话活动时间：${data.last_active}（已汇总至近7天累计与会话账本）` : '今日暂无模型请求';
+            document.getElementById('c2-reset').title = lastActStr ? `今日暂无新请求。上次会话活动时间：${String(data.last_active || '').slice(0, 32)}（已汇总至近7天累计与会话账本）` : '今日暂无模型请求';
         }
 
         // 3. 近7天累计 (Card 3)
@@ -5358,15 +5574,16 @@ function renderGrokBuild(data, item) {
         const pill = document.getElementById('hero-status-pill');
         pill.className = 'inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-purple-50 text-purple-700 border border-purple-200 min-w-0 max-w-[420px] truncate';
         const cd = quota.period_end ? formatCountdown(quota.period_end) : '周期有效';
-        let pillText = `${quota.tier || 'SuperGrok Heavy'} · 周额度剩余 ${remPct.toFixed(0)}% · ${cd}`;
+        let pillText = `${esc(quota.tier || 'SuperGrok Heavy')} · 周额度剩余 ${remPct.toFixed(0)}% · ${esc(cd)}`;
         if (quota.stale) pillText += ' · ⚠️ 额度取自日志回退';
-        if (data.local_scope_warning) pillText += ` · 本机仅 ${data.local_sessions} 个会话`;
+        if (data.local_scope_warning) pillText += ` · 本机仅 ${Number(data.local_sessions) || 0} 个会话`;
         pill.title = `${quota.tier || 'SuperGrok Heavy'} | 已用 ${usedPct}% | 剩余 ${remPct}% | 重置时间: ${quota.period_end || '--'}`
             + (quota.stale_hint ? ('\n⚠️ ' + quota.stale_hint) : '')
             + (data.local_scope_text ? ('\n' + data.local_scope_text) : '');
         const c1r = document.getElementById('c1-reset');
         if (c1r && quota.stale) c1r.title = quota.stale_hint || '';
-        pill.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-purple-500 animate-pulse"></span> <span class="truncate">${pillText}</span>`;
+        // pillText 含 quota.tier / 倒计时等外部字符串，且这里走 innerHTML —— 必须转义
+        pill.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-purple-500 animate-pulse"></span> <span class="truncate">${esc(pillText)}</span>`;
     } else {
         // 未获取到配额时的优雅降级
         const tCallsFallback = today.calls || 0;
@@ -5415,7 +5632,7 @@ function renderGrokBuild(data, item) {
             ? `本地会话 ${sCount} 个 · 实时自动追踪 · 纯本地免密`
             : '未检测到本机 Grok 会话记录（额度仍可正常查询）';
         pill.title = pillText;
-        pill.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-purple-500 shrink-0"></span> <span class="truncate">${pillText}</span>`;
+        pill.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-purple-500 shrink-0"></span> <span class="truncate">${esc(pillText)}</span>`;
     }
 }
 
@@ -5657,6 +5874,12 @@ let _loadTokenStatsReqId = 0;
 
 /* 清空底部统计面板（删掉最后一个 Key 之后必须清，否则残留上一个 Key 的数字） */
 function clearTokenStatsPanels() {
+    // 关键：作废所有在飞的统计请求。否则删除前发出的那次 loadTokenStats 返回后
+    // 仍会被当成「最新请求」，把 hint / 徽标又写回来（实测面板残留）。
+    _loadTokenStatsReqId++;
+    _isLoadingTokenStats = false;
+    const spin = document.getElementById('filter-only-key-icon');
+    if (spin) spin.classList.remove('animate-spin');
     ['kpi-sessions', 'kpi-tokens', 'kpi-cache'].forEach((id) => {
         const el = document.getElementById(id);
         if (el) el.innerText = '--';
@@ -5665,6 +5888,8 @@ function clearTokenStatsPanels() {
     try { renderKpiCost(_lastTotals); } catch (e) {}
     try { _trendData = []; updateTrendSummary(); drawTrendChart(); } catch (e) {}
     try { renderLeaderboard([]); } catch (e) {}
+    const badge = document.getElementById('stats-ledger-badge');
+    if (badge) { badge.innerText = '—'; badge.title = '暂无密钥'; }
     const hintEl = document.getElementById('stats-hint');
     if (hintEl) hintEl.innerText = '暂无密钥，先添加一个再查看用量';
 }
@@ -5923,7 +6148,7 @@ function drawTrendChart() {
     _trendData.forEach((d, i) => {
         if (i % stepLabel === 0 || i === N - 1) {
             const x = getX(i);
-            xLabelsHtml += `<text x="${x}" y="${h - 6}" text-anchor="middle" font-size="9.5" font-family="monospace" fill="var(--text-secondary)">${d.label || d.date}</text>`;
+            xLabelsHtml += `<text x="${x}" y="${h - 6}" text-anchor="middle" font-size="9.5" font-family="monospace" fill="var(--text-secondary)">${esc(d.label || d.date)}</text>`;
         }
     });
 
@@ -6008,6 +6233,8 @@ function drawTrendChart() {
         });
     }
 
+    // xLabelsHtml / seriesPaths 里已各自转义过外部字符串（d.label/d.date）；
+    // 其余全部是数字坐标。这里再兜一层：这些片段拼进 SVG 也是 innerHTML 语义。
     svg.innerHTML = defs + gridHtml + xLabelsHtml + seriesPaths + circlesHtml;
 }
 
@@ -6020,7 +6247,7 @@ function onHoverTrendPoint(evt, index) {
     const costUsd = (d.cost || 0).toFixed(2);
     const costCny = ((d.cost || 0) * _lastFx).toFixed(2);
     tt.innerHTML = `
-      <div style="font-weight:700; color:var(--text-title); border-bottom:1px solid var(--border-subtle); padding-bottom:3px; margin-bottom:4px;">📅 ${d.date}</div>
+      <div style="font-weight:700; color:var(--text-title); border-bottom:1px solid var(--border-subtle); padding-bottom:3px; margin-bottom:4px;">📅 ${esc(d.date)}</div>
       <div style="color:#38bdf8; margin-bottom:1px;">• Tokens: <b>${tokM} M</b></div>
       <div style="color:#fb923c; margin-bottom:1px;">• 折合费用: <b>$${costUsd} (≈¥${costCny})</b></div>
       <div style="color:#c084fc;">• 请求次数: <b>${d.calls || 0} 次</b></div>
@@ -6250,8 +6477,8 @@ function renderLeaderboard(perModel) {
             <div class="flex items-center gap-2.5 flex-1 min-w-0 pl-1">
                 <span class="w-2.5 h-2.5 rounded-full shadow-sm flex-shrink-0" style="background-color:${dotColor};"></span>
                 <div class="min-w-0 flex flex-col justify-center">
-                    <div class="text-xs font-semibold text-slate-800 truncate" title="${m.model || ''}">${m.model || ''}</div>
-                    <div class="text-[10px] text-slate-400 font-mono leading-tight truncate" title="${m.provider || ''}">${m.provider || ''}</div>
+                    <div class="text-xs font-semibold text-slate-800 truncate" title="${esc(m.model || '')}">${esc(m.model || '')}</div>
+                    <div class="text-[10px] text-slate-400 font-mono leading-tight truncate" title="${esc(m.provider || '')}">${esc(m.provider || '')}</div>
                 </div>
             </div>
             <div class="text-slate-500 text-center w-[58px] text-xs font-mono shrink-0 whitespace-nowrap">${m.count || 0}</div>
@@ -6347,8 +6574,8 @@ function copyModelTable() {
     let md = `| 模型 | 供应商 | 调用次数 | 输入Tokens | 输出Tokens | 命中缓存 | 总Token | 缓存率 | ${ccyHeader} |\n`;
     md += '| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n';
     _lastRows.forEach(m => {
-        const model = (m.model || '').replace(/\|/g, '\\|');
-        const provider = (m.provider || '').replace(/\|/g, '\\|');
+        const model = (m.model || '').replace(/\|/g, '\\|').replace(/[<>]/g, '');
+        const provider = (m.provider || '').replace(/\|/g, '\\|').replace(/[<>]/g, '');
         const count = m.count || 0;
         const inTok = fmtTok(m.input || 0);
         const outTok = fmtTok(_rowOutput(m));
@@ -6766,6 +6993,9 @@ function renderPathsPanel() {
               + `合计准确，但「按日」以会话创建日归属，跨天会话会整段计入创建日</div>`;
         box.innerHTML =
             cmRow +
+            (p.dsh_home_warning
+                ? `<div style="color:#f59e0b;">⚠ ${esc(p.dsh_home_warning)}</div>`
+                : '') +
             _pathRow('DSH 账本', p.dsh_ledger) +
             _pathRow('会话缓存', p.session_cache) +
             _pathRow('Grok 会话库', p.grok_home) +
@@ -7254,6 +7484,20 @@ if (window.pywebview && window.pywebview.api) {
 </body>
 </html>"""
 
+def _serialized(fn):
+    """把「读-改-写整份密钥表」的操作串行化。
+
+    add/edit/delete/move/save_tier/import 都是 load_keys() → 改 → save_keys()，
+    并发执行时后写的那次会把先写的那次整份冲掉。这里加一把模块级可重入锁，
+    让这些操作彼此互斥（它们都很快，不会影响查询并发）。
+    """
+    @functools.wraps(fn)
+    def wrapper(self, *a, **kw):
+        with _MUTATE_LOCK:
+            return fn(self, *a, **kw)
+    return wrapper
+
+
 def js_safe(fn):
     """把 js_api 的返回值统一净化后再交给 pywebview。
 
@@ -7308,9 +7552,11 @@ class DesktopAPI:
             "save_error": _LAST_SAVE_ERROR[0],
         }
 
+    @js_safe
     def selected_index(self):
+        """上次选中的 Key 索引。pywebview 会暴露所有公开方法，所以也要过净化。"""
         try:
-            return int(load_app_settings().get("selected_key", 0) or 0)
+            return _safe_int(load_app_settings().get("selected_key"), 0)
         except Exception:
             return 0
 
@@ -7329,6 +7575,7 @@ class DesktopAPI:
         return {"success": True, "theme": st["theme"]}
 
     # ---------- 数据源路径（开箱即用的关键：别人机器上的目录不一样） ----------
+    @js_safe
     def get_paths(self):
         """返回当前实际使用的各数据源路径 + 是否找到，供设置页展示/修改。"""
         st = load_app_settings()
@@ -7356,6 +7603,9 @@ class DesktopAPI:
             out["session_cache"] = {"path": "", "found": False}
         out["cost_meter"] = {"installed": cost_meter_installed()}
         out["env_dsh_home"] = os.getenv("DSH_HOME") or os.getenv("DSH_DATA_DIR") or ""
+        warn = dsh_home_warning()
+        if warn:
+            out["dsh_home_warning"] = warn
         return out
 
     @js_safe
@@ -7369,16 +7619,24 @@ class DesktopAPI:
             else:
                 st.pop(k, None)
         save_app_settings(st)
-        # 路径变了，所有缓存都必须失效
+        # 路径变了，所有缓存都必须失效（在各自锁内清，避免并发扫描清完立刻又填回）
         global GROK_SESSIONS_DIR
         with _LEDGER_LOCK:
             _LEDGER_CACHE.update({"path": "", "at": 0.0, "data": None, "warn": ""})
-        _KEYMAP_CACHE.update({"map": None, "at": 0.0, "err": ""})
-        _GROK_CACHE["at"] = 0.0
-        _GROK_SCAN_CACHE.clear()
+        with _KEYMAP_LOCK:
+            _KEYMAP_CACHE.update({"map": None, "at": 0.0, "err": ""})
+        with _GROK_LOCK:
+            _GROK_CACHE["at"] = 0.0
+        with _GROK_SCAN_LOCK:
+            _GROK_SCAN_CACHE.clear()
         with _DSH_SESSION_LOCK:
             _DSH_SESSION_CACHE.update({"at": 0.0, "home": "", "data": None, "warn": ""})
             _DSH_SESSION_CACHE["_files"] = {}
+        with _CLINE_CACHE_LOCK:
+            _CLINE_USAGE_CACHE.update({"at": 0.0, "uid": "", "time_key": "", "data": None})
+            _CLINE_UID_CACHE.clear()
+        with _GROK_QUOTA_LOCK:
+            _GROK_QUOTA_CACHE.update({"at": 0.0, "data": None})
         GROK_SESSIONS_DIR = _grok_sessions_dir()
         return {"success": True, "paths": self.get_paths()}
 
@@ -7386,6 +7644,23 @@ class DesktopAPI:
     def detect_paths(self):
         """重新自动探测一次（清掉手动指定）。"""
         return self.set_paths("", "", "")
+
+    def _apply_result(self, key_value, fields):
+        """把一次查询结果合并进**最新**的密钥存储（按 key 值定位），返回最新列表。
+
+        绝不能整份回写 self.keys：查询期间用户可能新增/删除了别的条目，
+        整份回写会把它们冲掉（实测：刷新中新增的 Key 会从磁盘消失、
+        刷新中删除的 Key 会复活）。
+        """
+        with self._lock:
+            cur = load_keys()
+            for x in cur:
+                if x.get("key") == key_value:
+                    x.update(fields)
+                    break
+            self.keys = cur
+            save_keys(cur)
+            return cur
 
     @js_safe
     def query_key(self, index, key_str=""):
@@ -7395,6 +7670,7 @@ class DesktopAPI:
             if target_idx == -1:
                 return {"error": "无效的 Key 索引或未找到该密钥", "keys": self.keys}
             it = self.keys[target_idx]
+            key_value = it.get("key")
             ch = key_channel(it)
             try:
                 if ch == CHANNEL_STEPFUN:
@@ -7414,16 +7690,14 @@ class DesktopAPI:
 
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if err:
-                it["last_error"] = str(err)
-                it["last_error_at"] = now_str
-                save_keys(self.keys)
-                return {"error": str(err), "key": it, "keys": self.keys}
-            it["last_result"] = data
-            it["last_update"] = now_str
-            it["last_error"] = None
-            save_keys(self.keys)
-            return {"data": data, "update_time": now_str, "key": it,
-                    "keys": self.keys, "index": target_idx}
+                cur = self._apply_result(key_value, {"last_error": str(err), "last_error_at": now_str})
+                tgt = next((x for x in cur if x.get("key") == key_value), it)
+                return {"error": str(err), "key": tgt, "keys": cur}
+            cur = self._apply_result(key_value, {"last_result": data, "last_update": now_str,
+                                                 "last_error": None})
+            tgt = next((x for x in cur if x.get("key") == key_value), it)
+            return {"data": data, "update_time": now_str, "key": tgt,
+                    "keys": cur, "index": target_idx}
 
     def _resolve_index(self, index, key_str=""):
         if key_str:
@@ -7446,13 +7720,14 @@ class DesktopAPI:
         today_info = daily.get(today_str, {"tokens": 0, "tokens_with_cache": 0, "cost": 0.0, "calls": 0})
         
         ks = sorted(daily.keys())
-        week_keys = ks[-7:] if len(ks) >= 7 else ks
+        # 真正的「最近 7 个自然日」窗口。旧实现用 ks[-7:]（有数据的最后 7 天），
+        # 中间有空洞时会悄悄跨到几个月前。Grok 的日键是本地日期，故 utc=False。
+        week_keys = set(_day_keys_for(ks, "近7天", utc=False))
         week_tok = sum(daily[k]["tokens_with_cache"] for k in week_keys)
         week_cost = sum(daily[k]["cost"] for k in week_keys)
         week_calls = sum(daily[k]["calls"] for k in week_keys)
 
-        month_prefix = datetime.now().strftime("%Y-%m")
-        month_keys = [k for k in ks if k.startswith(month_prefix)]
+        month_keys = set(_day_keys_for(ks, "本月", utc=False))
         month_tok = sum(daily[k]["tokens_with_cache"] for k in month_keys)
         month_cost = sum(daily[k]["cost"] for k in month_keys)
         month_calls = sum(daily[k]["calls"] for k in month_keys)
@@ -7604,12 +7879,15 @@ class DesktopAPI:
     def query_all(self, timeout=90):
         """并发刷新所有 Key。
 
-        修正三处历史缺陷：
+        修正四处缺陷：
           1) 旧实现从 self.keys[idx] 取条目，而其它 API 调用会并发重建 self.keys，
              结果可能被写进「另一个 Key」或被整份丢弃；
           2) fut.result() 没有超时，某个渠道卡住就永远不返回；
-          3) 每条失败原因放在 results 里但前端从不读，全部失败也会提示「刷新完成」。
-        现在：先快照、逐条写回、整体设截止时间、失败原因落到 last_error。
+          3) 每条失败原因放在 results 里但前端从不读，全部失败也会提示「刷新完成」；
+          4) **回写必须按 Key 值合并，不能整份覆盖快照**：刷新耗时可达十几秒，期间
+             用户新增的密钥会被旧快照静默删除、删除的密钥会复活（实测高危）。
+        现在：查询用快照、结果按 key 值合并回「最新」存储、整体设截止时间、
+        失败原因落到 last_error。
         """
         with self._lock:
             snapshot = load_keys()
@@ -7618,7 +7896,7 @@ class DesktopAPI:
         if n == 0:
             return {"results": [], "keys": [], "ok": 0, "failed": 0}
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
         deadline = time.time() + max(10, _safe_int(timeout, 90))
 
         def _worker(it):
@@ -7633,42 +7911,74 @@ class DesktopAPI:
                 return self._query_cline_backend(it)
             return fetch_usage(it.get("key"))
 
+        # 结果先落到「影子」条目上，不直接改 snapshot —— snapshot 可能与用户在
+        # 刷新期间新增/删除后的真实存储不一致。
         results = [None] * n
-        with ThreadPoolExecutor(max_workers=min(8, n)) as executor:
+        shadow = [{} for _ in range(n)]
+        # 注意：不能用 `with ThreadPoolExecutor(...)` —— 它的 __exit__ 是
+        # shutdown(wait=True)，即使提前跳出也照样等到所有 worker 结束，
+        # 截止时间形同虚设（实测 10s 截止跑满 25s）。
+        executor = ThreadPoolExecutor(max_workers=min(8, n))
+        timed_out = set()
+        try:
             future_map = {executor.submit(_worker, snapshot[i]): i for i in range(n)}
-            for fut in as_completed(future_map, timeout=None):
-                i = future_map[fut]
-                it = snapshot[i]
-                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                if time.time() > deadline:
-                    results[i] = {"error": "刷新超时（整体超过 %ds）" % _safe_int(timeout, 90), "index": i}
-                    continue
-                try:
-                    data, err = fut.result(timeout=max(1.0, deadline - time.time()))
-                except Exception as e:
-                    results[i] = {"error": "查询异常：%s" % e, "index": i}
-                    it["last_error"] = str(e)
-                    it["last_error_at"] = now_str
-                    continue
-                if err:
-                    results[i] = {"error": str(err), "index": i}
-                    it["last_error"] = str(err)
-                    it["last_error_at"] = now_str
-                else:
-                    it["last_result"] = data
-                    it["last_update"] = now_str
-                    it["last_error"] = None
-                    results[i] = {"ok": True, "index": i, "update_time": now_str}
+            try:
+                for fut in as_completed(future_map, timeout=max(1.0, deadline - time.time())):
+                    i = future_map[fut]
+                    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    try:
+                        data, err = fut.result(timeout=0)
+                    except Exception as e:
+                        results[i] = {"error": "查询异常：%s" % e, "index": i}
+                        shadow[i] = {"last_error": str(e), "last_error_at": now_str}
+                        continue
+                    if err:
+                        results[i] = {"error": str(err), "index": i}
+                        shadow[i] = {"last_error": str(err), "last_error_at": now_str}
+                    else:
+                        results[i] = {"ok": True, "index": i, "update_time": now_str}
+                        shadow[i] = {"last_result": data, "last_update": now_str, "last_error": None}
+            except FuturesTimeout:
+                # 到点了还有 worker 没回来：把它们标成超时并放弃等待
+                for fut, i in future_map.items():
+                    if results[i] is None:
+                        timed_out.add(i)
+                        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        msg = "刷新超时（整体超过 %ds）" % _safe_int(timeout, 90)
+                        results[i] = {"error": msg, "index": i}
+                        shadow[i] = {"last_error": msg, "last_error_at": now_str}
+        finally:
+            # 不等待：卡住的 worker 由它自己在网络超时后结束
+            executor.shutdown(wait=False, cancel_futures=True)
 
         ok = sum(1 for r in results if r and r.get("ok"))
         failed = n - ok
-        # 用快照整体替换，避免与并发调用互相覆盖
+
+        # 合并回最新存储：按 Key 值定位，只更新「此刻仍然存在」的条目。
+        # 刷新期间新增的 Key 保留（不在快照里 → 不会被覆盖）；
+        # 刷新期间删除的 Key 保持删除（在最新存储里找不到 → 不复活）。
         with self._lock:
-            self.keys = snapshot
-            save_keys(snapshot)
-        return {"results": results, "keys": snapshot, "ok": ok, "failed": failed}
+            current = load_keys()
+            by_key = {}
+            for it in current:
+                k = it.get("key")
+                if k and k not in by_key:
+                    by_key[k] = it
+            applied = 0
+            for i in range(n):
+                if not shadow[i]:
+                    continue
+                tgt = by_key.get(snapshot[i].get("key"))
+                if tgt is None:
+                    continue          # 刷新期间被删除 —— 尊重删除
+                tgt.update(shadow[i])
+                applied += 1
+            self.keys = current
+            save_keys(current)
+        return {"results": results, "keys": current, "ok": ok, "failed": failed}
 
     @js_safe
+    @_serialized
     def add_key(self, alias, key, channel, tier):
         self.keys = load_keys()
         alias = alias.strip() if alias else f"Key-{len(self.keys)+1}"
@@ -7709,6 +8019,7 @@ class DesktopAPI:
         return {"success": True, "keys": self.keys, "new_index": len(self.keys)-1}
 
     @js_safe
+    @_serialized
     def edit_key(self, index, alias, key, channel, tier, key_str=""):
         self.keys = load_keys()
         target_idx = self._resolve_index(index, key_str)
@@ -7757,6 +8068,7 @@ class DesktopAPI:
         return {"success": True, "keys": self.keys, "index": target_idx}
 
     @js_safe
+    @_serialized
     def delete_key(self, index, key_str=""):
         self.keys = load_keys()
         target_idx = self._resolve_index(index, key_str)
@@ -7767,6 +8079,7 @@ class DesktopAPI:
         return {"error": "索引错误或未找到该密钥", "keys": self.keys}
 
     @js_safe
+    @_serialized
     def save_tier(self, index, tier, key_str=""):
         self.keys = load_keys()
         target_idx = self._resolve_index(index, key_str)
@@ -7777,6 +8090,7 @@ class DesktopAPI:
         return {"error": "索引错误", "keys": self.keys}
 
     @js_safe
+    @_serialized
     def move_key(self, index, direction, key_str=""):
         self.keys = load_keys()
         n = len(self.keys)
@@ -7814,6 +8128,7 @@ class DesktopAPI:
         return {"success": True, "json_str": json.dumps(_json_safe(self.keys), ensure_ascii=False, indent=2)}
 
     @js_safe
+    @_serialized
     def import_keys(self, json_str):
         try:
             data = _safe_json_loads(json_str)
@@ -7910,7 +8225,11 @@ class DesktopAPI:
                 if grok_data and (grok_data.get("totals", {}).get("tokens_with_cache", 0) > 0 or grok_data.get("per_model")):
                     return merge_usage(dsh_data, grok_data)
             except Exception as e:
-                pass
+                # 不再静默：Grok 合并失败时明确告诉用户「这里只有 dsh 的数据」
+                import traceback
+                log_line("Grok 合并失败：%s\n%s" % (e, traceback.format_exc()))
+                dsh_data["hint"] = ((str(dsh_data.get("hint")) + "；") if dsh_data.get("hint") else "") + \
+                    "Grok 会话库读取失败，以上只含 dsh 账本数据：%s" % e
 
         return dsh_data
 

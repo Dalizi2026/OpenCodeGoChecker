@@ -4,6 +4,9 @@
 opencode_go_keys.json
 opencode_go_keys.json.*
 opencode_go_keys*.bak
+# 程序「导出备份」下载的文件名（用户可能顺手存进仓库再 commit）
+opencode_keys_backup_*.json
+*_keys_backup_*.json
 *.bak
 *.tmp
 app_settings.json
