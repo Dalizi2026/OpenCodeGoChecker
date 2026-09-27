@@ -67,7 +67,42 @@ pwsh -File build.ps1
 | **Grok 会话库** | `~/.grok/sessions` | Grok CLI / Grok Build 的会话目录 |
 | **opencode 本地库** | `~/.local/share/opencode/opencode.db`、`%APPDATA%\opencode\opencode.db` 等 | opencode 的 SQLite 库 |
 
-`<dsh_home>` 的候选：`~/.dsh`、`%APPDATA%\dsh`、`%LOCALAPPDATA%\DeepSeekHarness\data`、`%LOCALAPPDATA%\dsh`、`<各盘符>:/DeepSeekHarness/data`。程序也会读取 `DSH_HOME`、`DSH_DATA_DIR`、`DSH_PROFILE_DIR`、`GROK_HOME`、`OPENCODE_DATA`、`XDG_DATA_HOME`。
+`<dsh_home>` 的候选（按优先级）：
+
+1. 设置页里手工指定的路径
+2. 环境变量 `DSH_HOME` / `DSH_DATA_DIR`
+3. 环境变量 `DSH_PROFILE_DIR` 反推（`<home>/profiles/<profile>`）
+4. **从 Windows 注册表的 `dsh://` 协议处理器推出安装根目录** —— 见下
+5. `~/.dsh`、`%APPDATA%\dsh`、`%LOCALAPPDATA%\DeepSeekHarness\data`、`%LOCALAPPDATA%\dsh`
+6. 最后才按盘符猜 `<盘符>:/DeepSeekHarness/data`
+
+程序也会读取 `GROK_HOME`、`GROK_CONFIG_DIR`、`OPENCODE_DATA`、`XDG_DATA_HOME`。
+
+### 装在非默认位置也能找到（不用手填）
+
+dsh-desktop 把数据放在**安装根目录的 `data` 子目录**下，而安装根目录是安装时自选的 —— 有人装在 `D:\DeepSeekHarness`，别人可能装在 `F:\AI\dsh` 之类的地方。光靠「猜常见路径」是找不到的。
+
+所以程序会去读系统里**实际记录**的安装信息：
+
+- **dsh**：Windows 注册的 `dsh://` 协议处理器
+  （`HKCU\SOFTWARE\Classes\dsh\shell\open\command`）里写着可执行文件路径，
+  由它反推安装根目录，再拼 `data`。
+- **Grok**：grok CLI 自己就装在 `<grok_home>/bin/grok.exe`，安装时会把 `<grok_home>/bin`
+  写进用户 PATH。程序会从 PATH（以及注册表里持久化的 PATH）反推 `<grok_home>` ——
+  即使装完没重开终端也能找到。
+
+这两条线索只在 Windows 上生效，任何异常都会被静默跳过，不影响其它探测方式。安装位置在一次运行期间不会变，所以结果会缓存，不会反复读注册表。
+
+### 实在找不到怎么办
+
+设置页会明确列出每个数据源的**实际使用路径**和 **✓ 已找到 / ✕ 未找到**。如果显示未找到：
+
+1. 在对应输入框里填入正确路径，点「保存路径」；
+2. 或者点「重新自动探测」清掉手填值重新探测。
+
+dsh 那一栏填到**包含 `storages/` 的目录**（例如 `D:\DeepSeekHarness\data`），不是 `ledger.json` 文件本身；Grok 填到包含 `sessions/` 或 `auth.json` 的目录；opencode 则要填到 `.db` 文件本身。
+
+> 程序刻意**不会**在多个候选目录之间「随便找一个有数据的」：如果它选定了一个目录，那么账本、凭据、provider 配置都只会从这个目录读，不会出现「设置页显示的是 A 目录、数字却来自 B 目录」这种自相矛盾。
 
 ### 没装 dsh-cost-meter 插件也能用
 

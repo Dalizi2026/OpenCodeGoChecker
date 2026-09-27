@@ -783,12 +783,87 @@ def query_token_stats(time_key="全部"):
                 pass
 
 # ---------- dsh 本地账本数据源（主数据源） ----------
+_INSTALL_ROOT_CACHE = {}
+
+
+def _dsh_desktop_roots():
+    """从系统里**实际记录**的 dsh-desktop 安装信息推导数据目录。
+
+    为什么必须这么做：dsh-desktop（Electron 版）把数据放在「安装根目录/data」下，
+    而安装根目录是安装时用户自选的（本机是 `D:\\DeepSeekHarness`，别人完全可能装在
+    `F:\\AI\\dsh` 这种地方）。靠「D:/E:/C:/DeepSeekHarness/data」猜盘符，装在别的盘
+    或别的目录名就永远找不到 —— 用户只会看到一片 0，还不知道为什么。
+
+    系统里有一处可靠记录（Windows 注册的 `dsh://` 协议处理器，装完就有）：
+
+        HKCU\\SOFTWARE\\Classes\\dsh\\shell\\open\\command
+          = "D:\\DeepSeekHarness\\app\\DeepSeek Harness.exe" "%1"
+
+    由 exe 路径即可推出安装根目录（exe 位于 `<root>/app/` 下），再拼 `<root>/data`。
+    只在 Windows 且 `winreg` 可用时生效；任何异常都静默跳过，绝不影响其它探测路径。
+    """
+    if os.name != "nt":
+        return []
+    if "dsh" in _INSTALL_ROOT_CACHE:
+        return list(_INSTALL_ROOT_CACHE["dsh"])
+    try:
+        import winreg
+    except Exception:
+        _INSTALL_ROOT_CACHE["dsh"] = []
+        return []
+
+    def _read(root, sub):
+        try:
+            with winreg.OpenKey(root, sub) as k:
+                v, _t = winreg.QueryValueEx(k, "")
+            return str(v or "").strip()
+        except Exception:
+            return ""
+
+    raw = []
+    for name in ("dsh", "DeepSeekHarness", "deepseek-harness", "DeepSeek Harness"):
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            s = _read(hive, r"SOFTWARE\Classes\%s\shell\open\command" % name)
+            if s:
+                raw.append(s)
+    for name in ("DeepSeek Harness.exe", "dsh.exe", "DeepSeekHarness.exe"):
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            s = _read(hive, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\%s" % name)
+            if s:
+                raw.append(s)
+
+    out = []
+    for s in raw:
+        # 命令行形如： "D:\...\DeepSeek Harness.exe" "%1"
+        m = re.match(r'\s*"([^"]+\.exe)"', s, re.I)
+        exe = m.group(1) if m else (s.split(" ")[0] if s.lower().endswith(".exe") else "")
+        if not exe:
+            continue
+        try:
+            p = Path(exe)
+        except Exception:
+            continue
+        # exe 在 <root>/app/ 下 → 上级的上级就是安装根目录；也试 exe 所在目录本身
+        for base in (p.parent.parent, p.parent):
+            try:
+                if str(base) and str(base) != ".":
+                    out.append(base / "data")
+            except Exception:
+                pass
+    # 安装位置在一次运行期间不会变，缓存下来，避免每次刷新都读注册表
+    _INSTALL_ROOT_CACHE["dsh"] = list(out)
+    return out
+
+
 def _dsh_home_candidates():
     """DSH 数据目录候选（按优先级）：
     1) app_settings.json 里手工指定的 dsh_home（设置界面可填，最可靠）
     2) 环境变量 DSH_HOME / DSH_DATA_DIR —— dsh-desktop（Electron）用它指向数据目录
     3) 环境变量 DSH_PROFILE_DIR 反推（<home>/profiles/<profile>）
-    4) 常见默认位置（~/.dsh、%APPDATA%\\dsh、%LOCALAPPDATA%\\DeepSeekHarness\\data 等）
+    4) **从注册表的 dsh:// 协议处理器推出安装根目录**（见 _dsh_desktop_roots）
+       —— 这是别人机器上唯一能定位「装在非默认位置」的 dsh-desktop 的办法
+    5) 常见默认位置（~/.dsh、%APPDATA%\\dsh、%LOCALAPPDATA%\\DeepSeekHarness\\data 等）
+    6) 最后才是按盘符猜 DeepSeekHarness\\data
 
     注意：候选顺序只决定「优先级」，真正的挑选由 dsh_home() 按「哪个目录里真的有
     账本/凭据」来决定 —— 否则一台机器上同时存在旧 CLI 的 ~/.dsh 空壳和 desktop 的
@@ -814,6 +889,8 @@ def _dsh_home_candidates():
     appdata = os.getenv("APPDATA")
     local = os.getenv("LOCALAPPDATA")
     out.append(home / ".dsh")
+    # 注册表里记录的 dsh-desktop 安装位置（别人装在非默认目录时唯一的线索）
+    out.extend(_dsh_desktop_roots())
     if appdata:
         out.append(Path(appdata) / "dsh")
     if local:
@@ -2382,6 +2459,83 @@ def cline_usage_official(apikey, uid, time_key="全部", force=False, max_pages=
     return out
 
 # ---------- Grok Build 本地免密查询 ----------
+def _grok_install_roots():
+    """从系统**实际记录**的位置推导 grok 数据目录。
+
+    grok CLI 是自解压安装到 `~/.grok` 的：可执行文件在 `<home>/bin/grok.exe`，
+    安装时会把 `<home>/bin` 写进用户 PATH。所以有两条线索：
+      · PATH 上能找到 grok(.exe) → 它的上级的上级就是 `<home>`；
+      · PATH 里没有（装完没重开终端）→ 直接读注册表里的用户 / 系统 PATH。
+
+    这比死记 `~/.grok` 可靠：用户可以把整个目录搬走、或用 GROK_HOME 指到别处。
+
+    **过滤很重要**：PATH 里可能有 Ngrok 之类名字含 "grok" 的无关项，
+    所以只接受「`<候选>/auth.json` 或 `<候选>/sessions` 真的存在」的结果。
+    """
+    if "grok" in _INSTALL_ROOT_CACHE:
+        return list(_INSTALL_ROOT_CACHE["grok"])
+    cands = []
+
+    def _add_from_exe(exe):
+        try:
+            p = Path(exe)
+            if p.name.lower().startswith("grok") and p.parent.name.lower() == "bin":
+                cands.append(p.parent.parent)
+            else:
+                cands.append(p.parent)
+        except Exception:
+            pass
+
+    for name in ("grok", "grok.exe"):
+        try:
+            w = shutil.which(name)
+        except Exception:
+            w = None
+        if w:
+            _add_from_exe(w)
+
+    # 注册表里的 PATH（进程 PATH 可能是安装前的旧值）
+    if os.name == "nt":
+        try:
+            import winreg
+            for hive, sub in ((winreg.HKEY_CURRENT_USER, "Environment"),
+                              (winreg.HKEY_LOCAL_MACHINE,
+                               r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")):
+                try:
+                    with winreg.OpenKey(hive, sub) as k:
+                        v, _t = winreg.QueryValueEx(k, "Path")
+                except Exception:
+                    continue
+                for entry in str(v or "").split(";"):
+                    entry = entry.strip().strip('"')
+                    if not entry or "grok" not in entry.lower():
+                        continue
+                    try:
+                        p = Path(os.path.expandvars(entry))
+                    except Exception:
+                        continue
+                    # PATH 里通常是 <home>/bin；也可能是 <home> 本身
+                    cands.append(p.parent if p.name.lower() == "bin" else p)
+        except Exception:
+            pass
+
+    out, seen = [], set()
+    for p in cands:
+        try:
+            # 必须真的是 grok 的家目录，否则 Ngrok 之类的干扰项会被误收
+            if not ((p / "auth.json").exists() or (p / "sessions").exists()
+                    or (p / "bin" / "grok.exe").exists()):
+                continue
+            k = str(p).lower()
+        except Exception:
+            continue
+        if k not in seen:
+            seen.add(k)
+            out.append(p)
+    _INSTALL_ROOT_CACHE["grok"] = list(out)
+    return out
+
+
 def _grok_home_candidates():
     """Grok 数据目录候选。历史版本把 ~/.grok 写死，profile 被搬走就永远显示 0。"""
     out = []
@@ -2393,10 +2547,21 @@ def _grok_home_candidates():
         if v:
             out.append(Path(v))
     out.append(Path.home() / ".grok")
+    # 从 PATH / 注册表反推（用户把 .grok 搬走或改 GROK_HOME 时唯一的线索）
+    out.extend(_grok_install_roots())
     appdata = os.getenv("APPDATA")
     if appdata:
         out.append(Path(appdata) / "grok")
-    return out
+    seen, uniq = set(), []
+    for p in out:
+        try:
+            k = str(p).lower()
+        except Exception:
+            continue
+        if k not in seen:
+            seen.add(k)
+            uniq.append(p)
+    return uniq
 
 def grok_home():
     cands = _grok_home_candidates()
