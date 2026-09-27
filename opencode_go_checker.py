@@ -1000,6 +1000,8 @@ def load_dsh_ledger(force=False, max_age=10.0):
 _KEYMAP_CACHE = {"map": None, "at": 0.0, "err": ""}
 _KEYMAP_TTL = 300.0
 
+_KEYMAP_BUILDING = [False]
+
 def load_dsh_keymap(force=False):
     """{API Key 值: [providerId, ...]}，来自 $DSH_HOME/.credentials.yaml + provider 配置
     （旧版 CLI 在 settings.yaml；新版 desktop 在 profiles/<profile>/cordis.patch.yml）
@@ -1011,6 +1013,17 @@ def load_dsh_keymap(force=False):
     if (not force and _KEYMAP_CACHE["map"] is not None
             and (now - _KEYMAP_CACHE["at"]) < _KEYMAP_TTL):
         return _KEYMAP_CACHE["map"]
+    if _KEYMAP_BUILDING[0]:
+        # 防重入：构建过程中会读取账本/会话缓存，万一将来那条链路又绕回这里，
+        # 直接返回空表，绝不允许无限递归。
+        return {}
+    _KEYMAP_BUILDING[0] = True
+    try:
+        return _build_dsh_keymap(now)
+    finally:
+        _KEYMAP_BUILDING[0] = False
+
+def _build_dsh_keymap(now):
     keymap = {}
     if yaml is None:
         _KEYMAP_CACHE.update({"map": keymap, "at": now, "err": "未安装 PyYAML，无法读取 dsh 凭据"})
@@ -1057,7 +1070,11 @@ def load_dsh_keymap(force=False):
                 with open(cp, "r", encoding="utf-8") as f:
                     cd = yaml.safe_load(f) or {}
                 refs = {str(k): str(v) for k, v in (cd.get("refs") or {}).items() if v}
-                data, _w = load_dsh_ledger()
+                # 用 _load_dsh_any 而不是 load_dsh_ledger：没装 cost-meter 插件时
+                # 账本不存在，但会话缓存里同样有 byProviderModel，照样能反查出
+                # 「这个 Key 对应哪个 provider」。只用账本会让回退模式下所有 Key
+                # 都匹配不到 provider，「仅当前 Key」永远是 0。
+                data, _w, _fb = _load_dsh_any()
                 if data is not None:
                     ledger_pids = set()
                     for d in _ledger_days(data).values():
