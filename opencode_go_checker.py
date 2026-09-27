@@ -4084,6 +4084,34 @@ __TAILWIND_SCRIPT_INLINE__
     background: rgba(127, 127, 127, 0.14); padding: 0 3px; border-radius: 3px;
   }
 
+  /* ---------- 用量面板下方的状态提示条 ----------
+     单独一行、可换行、可任意位置断行，长句再也不会被裁掉。 */
+  .stats-notice {
+    margin: 8px 0 0; padding: 7px 10px; border-radius: 7px;
+    font-size: 11.5px; line-height: 1.6;
+    background: rgba(245, 158, 11, 0.10);
+    border: 1px solid rgba(245, 158, 11, 0.30);
+    color: var(--accent-amber);
+    overflow-wrap: anywhere; word-break: break-word;
+  }
+  .stats-notice.info {
+    background: var(--bg-card-subtle); border-color: var(--border-subtle);
+    color: var(--text-secondary);
+  }
+  .stats-notice.ok {
+    background: rgba(34, 197, 94, 0.10); border-color: rgba(34, 197, 94, 0.30);
+    color: var(--accent-green);
+  }
+  .stats-notice.hidden { display: none; }
+
+  /* 没有密钥时，「仅当前 Key」胶囊要看起来是不可用的：
+     否则界面会自相矛盾 —— 它宣称在按当前 Key 过滤，实际显示的却是全渠道数据。 */
+  .toolbar-chip.disabled {
+    opacity: 0.5; cursor: not-allowed !important;
+    background: transparent !important; border-color: var(--border-subtle) !important;
+    color: var(--text-muted) !important;
+  }
+
   /* 设置页分区标题 */
   .settings-section-title {
     display: flex; align-items: center; gap: 7px;
@@ -4868,11 +4896,15 @@ __TAILWIND_SCRIPT_INLINE__
             <span class="shrink-0">复制表格</span>
           </button>
 
-          <!-- 5. 数据源徽章与提示 -->
+          <!-- 5. 数据源徽章 -->
           <span id="stats-ledger-badge" class="toolbar-badge">dsh账本</span>
-          <span id="stats-hint" class="text-xs text-amber-500 font-medium shrink-0 whitespace-nowrap"></span>
         </div>
       </div>
+
+      <!-- 状态提示：单独占一行。
+           以前它挤在工具栏最右边，还带着 shrink-0 + whitespace-nowrap，
+           工具栏一窄就被父容器整段裁掉（用户实测只看到「还没有添加任何…」）。 -->
+      <div id="stats-hint" class="stats-notice hidden"></div>
 
       <!-- Tab 0: Analytics -->
       <div id="tab-content-0" class="flex-1 pt-2.5 flex flex-col min-h-0">
@@ -5295,8 +5327,10 @@ function renderKeyList() {
         container.appendChild(groupDiv);
     });
 
-    // 图标要跟着「还有没有展开的分组」变
+    // 图标要跟着「还有没有展开的分组」变；「仅当前 Key」胶囊也要跟着密钥数量变
+    // （0 个密钥时它必须显示成不可用，否则界面自相矛盾）
     _updateToggleAllIcon();
+    updateOnlyKeyButtonUI();
 
     // 兜底渲染未知渠道
     if (otherKeys.length > 0) {
@@ -6158,6 +6192,19 @@ function updateOnlyKeyButtonUI() {
     const textEl = document.getElementById('filter-only-key-text');
     const iconEl = document.getElementById('filter-only-key-icon');
     if (!btn) return;
+    const noKeys = !(appState && appState.keys && appState.keys.length > 0);
+    if (noKeys) {
+        // 没有密钥时这个开关没有意义：它宣称「按当前 Key 过滤」，可实际一个 Key
+        // 都没有，数据口径和按钮文案对不上 —— 界面自相矛盾（用户实测反馈）。
+        // 显示成不可用状态，并说清要先做什么。
+        btn.classList.remove('active');
+        btn.classList.add('disabled');
+        if (textEl) textEl.innerText = '需先添加密钥';
+        if (iconEl) iconEl.classList.add('opacity-60');
+        btn.title = '还没有添加任何密钥，无法按渠道查看用量。点左上角「+」添加';
+        return;
+    }
+    btn.classList.remove('disabled');
     if (_onlyCurrentKey) {
         btn.classList.add('active');
         if (textEl) textEl.innerText = '仅当前 Key';
@@ -6172,6 +6219,10 @@ function updateOnlyKeyButtonUI() {
 }
 
 function toggleOnlyKeyFilter() {
+    if (!(appState && appState.keys && appState.keys.length > 0)) {
+        showToast('请先添加密钥，再按渠道查看用量', 'warning', 2200);
+        return;
+    }
     if (_isLoadingTokenStats) {
         showToast('正在统计用量，请稍候...', 'info', 800);
         return;
@@ -6202,13 +6253,26 @@ function clearTokenStatsPanels() {
     });
     try { _lastTotals = { sessions: 0, tokens: 0, tokens_with_cache: 0, cache: 0, cost: 0.0, fx: 7.2 }; } catch (e) {}
     try { renderKpiCost(_lastTotals); } catch (e) {}
+    // renderKpiCost 会把 0 格式化成「$0.00 ≈ ¥0.0」，清空态要的是「--」
+    const costEl = document.getElementById('kpi-cost');
+    if (costEl) { costEl.innerText = '--'; costEl.title = '暂无数据'; }
     try { _trendData = []; updateTrendSummary(); drawTrendChart(); } catch (e) {}
     try { renderLeaderboard([]); } catch (e) {}
     try { resetRawJsonPane(); } catch (e) {}
     const badge = document.getElementById('stats-ledger-badge');
     if (badge) { badge.innerText = '—'; badge.title = '暂无密钥'; }
-    const hintEl = document.getElementById('stats-hint');
-    if (hintEl) hintEl.innerText = '暂无密钥，先添加一个再查看用量';
+    _setStatsHint('暂无密钥，先添加一个再查看用量');
+}
+
+/* 状态提示：单独一行的通知条。
+   以前它挤在工具栏最右边而且不许换行，一窄就被整段裁掉，用户只能看到
+   「还没有添加任何…」。现在按语义上色，并且空内容时自动隐藏。 */
+function _setStatsHint(text, kind) {
+    const el = document.getElementById('stats-hint');
+    if (!el) return;
+    const t = (text === null || text === undefined) ? '' : String(text);
+    el.innerText = t;
+    el.className = 'stats-notice' + (kind ? (' ' + kind) : '') + (t ? '' : ' hidden');
 }
 
 async function loadTokenStats(overrideTimeKey) {
@@ -6224,11 +6288,11 @@ async function loadTokenStats(overrideTimeKey) {
         }
     }, 170000);
 
-    const hintEl = document.getElementById('stats-hint');
     const iconEl = document.getElementById('filter-only-key-icon');
     if (iconEl) iconEl.classList.add('animate-spin');
-    if (hintEl && !hintEl.innerText) {
-        hintEl.innerText = '正在统计用量...';
+    const hintNow = document.getElementById('stats-hint');
+    if (hintNow && !hintNow.innerText) {
+        _setStatsHint('正在统计用量...', 'info');
     }
 
     try {
@@ -6248,14 +6312,26 @@ async function loadTokenStats(overrideTimeKey) {
 
         const res = await apiCall('get_token_stats', [timeKey, 'dsh 账本', onlyKey, currentKeyIndex, currentKeyStr], 150000);
         if (reqId !== _loadTokenStatsReqId) return;
+
+        // 一个密钥都没有：不显示任何用量，只提示去添加。
+        // 用量要按渠道 / 账号区分才有意义，把本机所有 provider 混在一起报总数
+        // 既归属不到账号，又会让人以为工具在乱报数字。
+        if (res && res.need_key) {
+            clearTokenStatsPanels();
+            _setStatsHint(res.hint || '请先添加密钥', 'info');
+            const b0 = document.getElementById('stats-ledger-badge');
+            if (b0) { b0.innerText = '未添加密钥'; b0.title = '添加密钥后才能查看该渠道的用量'; }
+            return;
+        }
+
         // 只有「确实没有数据」才清空面板。带 totals 的警告（例如未装
         // dsh-cost-meter 插件而走了会话缓存回退）必须照常渲染，只是把说明显示出来。
         if (res && res.error && !(res.totals || (res.per_model && res.per_model.length))) {
-            if (hintEl) hintEl.innerText = res.error;
+            _setStatsHint(res.error, 'warn');
             try { renderLeaderboard([]); } catch (e) {}
             return;
         }
-        if (res && res.error && hintEl) hintEl.innerText = res.error;
+        if (res && res.error) _setStatsHint(res.error, 'warn');
 
         // 无论数据是否为空，都明确刷新或清空 4 个 KPI 卡片，彻底杜绝残留上一个 Key 的数据！
         const t = (res && res.totals) ? res.totals : { sessions: 0, tokens: 0, tokens_with_cache: 0, cache: 0, cost: 0.0, fx: 7.2 };
@@ -6312,15 +6388,16 @@ async function loadTokenStats(overrideTimeKey) {
 
         if (res && res.per_model && res.per_model.length > 0) {
             renderLeaderboard(res.per_model);
-            if (hintEl) hintEl.innerText = res.hint || '';
+            _setStatsHint(res.hint || '', res.hint_kind || 'info');
         } else {
             renderLeaderboard([]);
-            if (hintEl) hintEl.innerText = (res && (res.error || res.hint)) ? (res.error || res.hint) : '该范围没有用量记录';
+            const msg = (res && (res.error || res.hint)) ? (res.error || res.hint) : '该范围没有用量记录';
+            _setStatsHint(msg, (res && res.error) ? 'warn' : 'info');
         }
     } catch(e) {
         console.error("Token stats error:", e);
-        if (reqId === _loadTokenStatsReqId && hintEl) {
-            hintEl.innerText = '用量统计失败: ' + (e.message || e);
+        if (reqId === _loadTokenStatsReqId) {
+            _setStatsHint('用量统计失败: ' + (e.message || e), 'warn');
         }
     } finally {
         if (reqId === _loadTokenStatsReqId) {
@@ -7146,6 +7223,10 @@ function submitKeyForm() {
                 showToast('密钥添加成功', 'success');
                 // 添加后自动查询一次，直接看到数据
                 doQueryCurrent();
+                // 用量面板也要跟着刷新：第一把密钥加进来之后，面板必须从
+                // 「请先添加密钥」切回正常显示（以前只刷了密钥列表，面板会一直
+                // 停在空状态，直到用户手动改时间范围才发现）。
+                loadTokenStats();
             }
         }).catch(e => _showModalError('添加失败: ' + e));
     }
@@ -7252,6 +7333,9 @@ function confirmDeleteKey() {
         renderKeyList();
         selectKey(currentKeyIndex);
         showToast('密钥已删除', 'success');
+        // 删掉最后一把密钥时必须让面板切回「请先添加密钥」，
+        // 否则会残留上一个 Key 的用量数字。
+        loadTokenStats();
     });
 }
 
@@ -8520,7 +8604,24 @@ class DesktopAPI:
         target_idx = self._resolve_index(key_index, key_str)
         if target_idx == -1:
             target_idx = _safe_int(key_index)
-        
+
+        # 0. 一个密钥都没有：**任何口径都不显示用量**，只提示去添加。
+        #
+        # 用量必须按渠道 / 账号区分才有意义（这正是这个工具存在的理由）。把本机
+        # 所有 provider 混在一起报一个总数，既归属不到任何账号，又会让用户看到
+        # 「没有密钥却有用量」而以为工具在乱报数字（实测反馈）。
+        #
+        # 放在最前面是为了堵住一条绕行路径：先有密钥、切到「全渠道汇总」、再把
+        # 密钥全删掉 —— 那样 only_key 会是 False，只在 only_key 分支里拦是拦不住的。
+        if not self.keys:
+            return {
+                "per_model": [], "totals": None, "daily_series": [],
+                "error": None, "source": "none", "db": "", "days": 0,
+                "need_key": True,
+                "hint": "请先添加密钥：点左上角「+」选择渠道并填入该渠道的 API Key。"
+                        "添加后这里会显示该渠道的用量。",
+            }
+
         # 1. 勾选“仅当前 Key”：精准按当前选中的条目过滤
         if only_key:
             if 0 <= target_idx < len(self.keys):
@@ -8565,14 +8666,8 @@ class DesktopAPI:
                 else:
                     return query_token_stats(time_key)
             else:
-                # 「仅当前 Key」但没有可选的 Key。
-                # 一个 Key 都没有时退化成全渠道汇总 —— 否则新用户（还没添加任何
-                # 密钥，但本机已经有 dsh 数据）永远看到 0，会以为工具坏了。
-                if not self.keys:
-                    allview = dsh_usage(None, time_key) if source.startswith("dsh") else query_token_stats(time_key)
-                    allview["hint"] = ("还没有添加任何密钥，当前显示的是本机全部渠道用量。"
-                                       "点左上角「+」添加密钥后可只看单个 Key。")
-                    return allview
+                # 「仅当前 Key」但索引越界（密钥被删/列表变动）。0 密钥的情况
+                # 已经在最前面拦掉了，这里只剩「有密钥但索引不合法」。
                 return dsh_usage([], time_key) if source.startswith("dsh") else query_token_stats(time_key)
 
         # 2. 未勾选“仅当前 Key”：全渠道总览（深度合并 dsh 账本与 Grok Build 本地会话）
