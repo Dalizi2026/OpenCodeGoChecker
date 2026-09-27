@@ -100,7 +100,7 @@ dsh-desktop 把数据放在**安装根目录的 `data` 子目录**下，而安�
 1. 在对应输入框里填入正确路径，点「保存路径」；
 2. 或者点「重新自动探测」清掉手填值重新探测。
 
-dsh 那一栏填到**包含 `storages/` 的目录**（例如 `D:\DeepSeekHarness\data`），不是 `ledger.json` 文件本身；Grok 填到包含 `sessions/` 或 `auth.json` 的目录；opencode 则要填到 `.db` 文件本身。
+dsh 那一栏填到**包含 `storages/` 的目录**（例如 `D:\dsh\data`），不是 `ledger.json` 文件本身；Grok 填到包含 `sessions/` 或 `auth.json` 的目录；opencode 则要填到 `.db` 文件本身。
 
 > 程序刻意**不会**在多个候选目录之间「随便找一个有数据的」：如果它选定了一个目录，那么账本、凭据、provider 配置都只会从这个目录读，不会出现「设置页显示的是 A 目录、数字却来自 B 目录」这种自相矛盾。
 

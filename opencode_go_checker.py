@@ -808,7 +808,7 @@ def _dsh_desktop_roots():
     系统里有一处可靠记录（Windows 注册的 `dsh://` 协议处理器，装完就有）：
 
         HKCU\\SOFTWARE\\Classes\\dsh\\shell\\open\\command
-          = "D:\\DeepSeekHarness\\app\\DeepSeek Harness.exe" "%1"
+          = "<安装根目录>\\app\\DeepSeek Harness.exe" "%1"
 
     由 exe 路径即可推出安装根目录（exe 位于 `<root>/app/` 下），再拼 `<root>/data`。
     只在 Windows 且 `winreg` 可用时生效；任何异常都静默跳过，绝不影响其它探测路径。
