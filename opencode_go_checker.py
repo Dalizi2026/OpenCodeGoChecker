@@ -801,8 +801,8 @@ def _dsh_desktop_roots():
     """从系统里**实际记录**的 dsh-desktop 安装信息推导数据目录。
 
     为什么必须这么做：dsh-desktop（Electron 版）把数据放在「安装根目录/data」下，
-    而安装根目录是安装时用户自选的（本机是 `D:\\DeepSeekHarness`，别人完全可能装在
-    `F:\\AI\\dsh` 这种地方）。靠「D:/E:/C:/DeepSeekHarness/data」猜盘符，装在别的盘
+    而安装根目录是安装时用户自选的（有人装在 `D:\\dsh`，也有人装在 `F:\\AI\\dsh`
+    这种地方）。靠「D:/E:/C:/DeepSeekHarness/data」猜盘符，装在别的盘
     或别的目录名就永远找不到 —— 用户只会看到一片 0，还不知道为什么。
 
     系统里有一处可靠记录（Windows 注册的 `dsh://` 协议处理器，装完就有）：
@@ -7800,7 +7800,7 @@ if (window.pywebview && window.pywebview.api) {
 
         <div style="margin-top:11px;">
           <label class="field-label" for="path-dsh-home">DSH 数据目录</label>
-          <input id="path-dsh-home" class="modal-input" type="text" placeholder="例如 D:\\DeepSeekHarness\\data 或 ~/.dsh">
+          <input id="path-dsh-home" class="modal-input" type="text" placeholder="例如 D:\\dsh 或 ~/.dsh">
           <div class="field-help">该目录下应有 <code>storages/cost-meter/ledger.json</code>（装了费用插件）或 <code>storages/session_projcache/</code>（没装插件时用它统计）。</div>
         </div>
 
