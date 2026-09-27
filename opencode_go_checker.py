@@ -219,8 +219,22 @@ CLINE_DAILY_PATH = "/api/v1/users/{uid}/usages/daily"       # 官方按天/按�
 CLINE_RECORDS_PATH = "/api/v1/users/{uid}/usages"           # 官方逐条调用记录（含 cachedTokens）
 # 余额量纲已标定（2026-09-23）：面板显示 Credits 0.2425，接口返回 242476 → 1e6 微美元 = 1 Credit
 CLINE_BALANCE_DIVISOR = 1_000_000
-# costUsd 同为微美元量纲；官方逐条接口每页最多返回 200 条，用 nextToken 翻页
-CLINE_COST_DIVISOR = 1_000_000
+# costUsd 的量纲是**另外标定**的，别和余额混为一谈（2026-09-28）。
+#
+# 旧实现想当然地写成 1e6（「同为微美元量纲」），结果把费用放大了 100 倍 ——
+# 用户实测：本机 436M tokens 显示 $470，而套餐价只有 $9.99/月。
+#
+# 标定依据（三条互相独立，全部指向 1e8）：
+#   1) 逐条接口里 costUsd 恒等于 creditsUsed × 100，39 条 BYOK 记录无一例外
+#      （257466/2574、2208915/22089、378921/3789 …）。
+#   2) creditsUsed 与 balance 同量纲（balance 242476 ↔ 面板 0.2425 Credits，
+#      即 1e6 单位 = 1 Credit）。于是 costUsd 的单位是 1e-8 Credit。
+#   3) 官方 /plan/usage-limits 报「本月已用 8%」。按 1e8 算本月用量 $4.70，
+#      反推月上限约 $58.76 —— 对 $9.99/月的套餐是合理的 5.9 倍；
+#      按 1e6 算则上限高达 $5876（588 倍），不可能。
+#
+# 校验恒等式：costUsd / 1e8  ==  creditsUsed / 1e6
+CLINE_COST_DIVISOR = 100_000_000
 CLINE_PAGE_LIMIT = 200
 CLINE_MAX_PAGES = 12
 _CLINE_USAGE_CACHE = {"at": 0.0, "uid": "", "time_key": "", "data": None, "warn": ""}
@@ -2456,6 +2470,8 @@ def cline_usage_official(apikey, uid, time_key="全部", force=False, max_pages=
         "error": None, "source": "cline-official", "db": "api.cline.bot/users/%s/usages" % uid,
         "days": len(day_keys),
         "hint": ("官网口径（含所有客户端）；明细已取最近 %d 条%s%s"
+                 "。费用是官方按标价折算的等价金额："
+                 "套餐内的调用（cline-pass/* 模型）不逐次扣费，实际以订阅账单为准。"
                  % (len(recs),
                     "，更早的记录未纳入" if truncated else "",
                     "；⚠ 翻页中途失败，以上合计不完整" if failed else "")),
