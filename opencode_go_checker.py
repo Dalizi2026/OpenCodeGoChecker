@@ -120,6 +120,17 @@ def _safe_json_loads(text):
     return json.loads(text, parse_constant=_bad, parse_float=_num)
 
 
+def _safe_str_list(v, limit=64, item_len=32):
+    """把任意输入收敛成「短字符串列表」，用于写进设置文件。"""
+    if not isinstance(v, (list, tuple)):
+        return []
+    out = []
+    for x in v[:limit]:
+        if isinstance(x, str) and x.strip():
+            out.append(x.strip()[:item_len])
+    return out
+
+
 def _safe_int(v, default=0):
     try:
         f = float(v)
@@ -4600,11 +4611,18 @@ __TAILWIND_SCRIPT_INLINE__
         </svg>
         <span id="sidebar-keys-count" class="text-xs font-semibold text-slate-700 tracking-wider">已存密钥 (0)</span>
       </div>
-      <button onclick="openAddKeyModal()" title="添加密钥" class="w-6 h-6 rounded flex items-center justify-center text-slate-500 hover:text-blue-600 hover:bg-blue-50 transition border-none bg-transparent cursor-pointer">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-          <line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line>
-        </svg>
-      </button>
+      <div class="flex items-center gap-0.5">
+        <button onclick="toggleAllChannels()" id="btn-toggle-all" title="全部收起 / 全部展开" class="w-6 h-6 rounded flex items-center justify-center text-slate-500 hover:text-blue-600 hover:bg-blue-50 transition border-none bg-transparent cursor-pointer">
+          <svg id="btn-toggle-all-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <polyline points="7 9 12 4 17 9"></polyline><polyline points="7 15 12 20 17 15"></polyline>
+          </svg>
+        </button>
+        <button onclick="openAddKeyModal()" title="添加密钥" class="w-6 h-6 rounded flex items-center justify-center text-slate-500 hover:text-blue-600 hover:bg-blue-50 transition border-none bg-transparent cursor-pointer">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+        </button>
+      </div>
     </div>
 
     <!-- Key Cards (Clickable) -->
@@ -5112,7 +5130,32 @@ function _getKeyQuotaIndicator(it) {
     return { rightHtml, bottomTrack };
 }
 
-let channelCollapsedState = {};
+/* 密钥分组的展开/收起状态。
+   旧版只是个内存对象，重启就丢 —— 用户每次打开都看到「全部展开」的长列表。
+   现在写进 app_settings.json 的 collapsed_channels（记录**收起**的分组 id），
+   各分组互相独立，所以「有的开着有的关着」也能原样恢复。 */
+let channelCollapsedState = (function () {
+    const out = {};
+    const saved = (appState && appState.collapsed_channels) || [];
+    if (Array.isArray(saved)) {
+        saved.forEach(c => { if (typeof c === 'string' && c) out[c] = true; });
+    }
+    return out;
+})();
+
+let _collapsedSaveTimer = null;
+// 启动恢复期间为 true：此时不要因为「选中项在某个折叠分组里」而自动展开它
+let _suppressAutoExpand = false;
+function _persistCollapsedChannels() {
+    if (_collapsedSaveTimer) clearTimeout(_collapsedSaveTimer);
+    // 防抖：连点几个分组时只写一次盘
+    _collapsedSaveTimer = setTimeout(() => {
+        _collapsedSaveTimer = null;
+        if (!window.pywebview || !window.pywebview.api) return;
+        const list = Object.keys(channelCollapsedState).filter(k => channelCollapsedState[k]);
+        apiCall('set_collapsed_channels', [list], 10000);
+    }, 250);
+}
 
 const CHANNEL_DEFS = [
     { id: 'opencode-go', name: 'OpenCode Go', short: 'Go', badgeClass: 'badge-go' },
@@ -5122,20 +5165,47 @@ const CHANNEL_DEFS = [
     { id: 'cline', name: 'Cline Pass', short: 'Cline', badgeClass: 'badge-cline' },
 ];
 
-function toggleChannelCollapse(channelId) {
-    channelCollapsedState[channelId] = !channelCollapsedState[channelId];
+function _applyCollapseVisual(channelId) {
+    const collapsed = !!channelCollapsedState[channelId];
     const bodyEl = document.getElementById(`channel-body-${channelId}`);
     const chevEl = document.getElementById(`channel-chev-${channelId}`);
-    if (bodyEl) {
-        bodyEl.style.display = channelCollapsedState[channelId] ? 'none' : 'block';
-    }
-    if (chevEl) {
-        if (channelCollapsedState[channelId]) {
-            chevEl.classList.add('-rotate-90');
-        } else {
-            chevEl.classList.remove('-rotate-90');
-        }
-    }
+    if (bodyEl) bodyEl.style.display = collapsed ? 'none' : 'block';
+    if (chevEl) chevEl.classList.toggle('-rotate-90', collapsed);
+}
+
+function toggleChannelCollapse(channelId) {
+    channelCollapsedState[channelId] = !channelCollapsedState[channelId];
+    _applyCollapseVisual(channelId);
+    _persistCollapsedChannels();
+    _updateToggleAllIcon();
+}
+
+/* 全部收起 / 全部展开：长列表时一键收干净，比逐个点快得多 */
+function toggleAllChannels() {
+    const ids = CHANNEL_DEFS.map(c => c.id).concat(['other']);
+    const anyExpanded = ids.some(id => !channelCollapsedState[id]
+        && document.getElementById(`channel-body-${id}`));
+    ids.forEach(id => {
+        channelCollapsedState[id] = anyExpanded;   // 还有展开的就全收，否则全开
+        _applyCollapseVisual(id);
+    });
+    _persistCollapsedChannels();
+    _updateToggleAllIcon();
+    showToast(anyExpanded ? '已全部收起' : '已全部展开', 'info', 1200);
+}
+
+function _updateToggleAllIcon() {
+    const icon = document.getElementById('btn-toggle-all-icon');
+    const btn = document.getElementById('btn-toggle-all');
+    if (!icon || !btn) return;
+    const ids = CHANNEL_DEFS.map(c => c.id).concat(['other']);
+    const anyExpanded = ids.some(id => !channelCollapsedState[id]
+        && document.getElementById(`channel-body-${id}`));
+    // 还有展开的 → 按钮显示「收起」的双箭头；全收起 → 显示「展开」
+    icon.innerHTML = anyExpanded
+        ? '<polyline points="7 9 12 4 17 9"></polyline><polyline points="7 15 12 20 17 15"></polyline>'
+        : '<polyline points="7 4 12 9 17 4"></polyline><polyline points="7 20 12 15 17 20"></polyline>';
+    btn.title = anyExpanded ? '全部收起' : '全部展开';
 }
 
 function renderKeyList() {
@@ -5224,6 +5294,9 @@ function renderKeyList() {
         groupDiv.appendChild(bodyDiv);
         container.appendChild(groupDiv);
     });
+
+    // 图标要跟着「还有没有展开的分组」变
+    _updateToggleAllIcon();
 
     // 兜底渲染未知渠道
     if (otherKeys.length > 0) {
@@ -5318,13 +5391,14 @@ function selectKey(idx) {
     const ch = it.channel || 'opencode-go';
     // 未知渠道在 DOM 里归到 other 分组；旧实现直接用渠道名取 id，取不到就静默不展开
     const groupId = ['opencode-go', 'commandcode', 'stepfun', 'grok-build', 'cline'].includes(ch) ? ch : 'other';
-    // 若当前选中的 Key 所在分组处于折叠状态，自动展开以确保可见
-    if (channelCollapsedState[groupId]) {
+    // 选中的 Key 落在折叠分组里时自动展开，保证用户看得见。
+    // 但**启动恢复阶段不做这件事** —— 否则用户上次特意收起的那个分组会因为
+    // 里面有个被选中的 Key 又被拉开，「记忆」就白做了。用户主动点击时才展开。
+    if (!_suppressAutoExpand && channelCollapsedState[groupId]) {
         channelCollapsedState[groupId] = false;
-        const bodyEl = document.getElementById(`channel-body-${groupId}`);
-        const chevEl = document.getElementById(`channel-chev-${groupId}`);
-        if (bodyEl) bodyEl.style.display = 'block';
-        if (chevEl) chevEl.classList.remove('-rotate-90');
+        _applyCollapseVisual(groupId);
+        _persistCollapsedChannels();
+        _updateToggleAllIcon();
     }
 
     const isGo = ch === 'opencode-go';
@@ -7446,8 +7520,11 @@ function initImmediateUI() {
     updateOnlyKeyButtonUI();
     renderKeyList();
     if (appState && appState.keys && appState.keys.length > 0) {
-        selectKey(currentKeyIndex);
+        // 恢复上次的选中项时不要动用户存下的展开/收起状态
+        _suppressAutoExpand = true;
+        try { selectKey(currentKeyIndex); } finally { _suppressAutoExpand = false; }
     }
+    _updateToggleAllIcon();
 }
 
 if (document.readyState === 'loading') {
@@ -7816,6 +7893,7 @@ class DesktopAPI:
             "tier_labels": STEPFUN_TIER_LABELS,
             "default_tier": DEFAULT_STEP_TIER,
             "theme": st.get("theme", "obsidian"),
+            "collapsed_channels": _safe_str_list(st.get("collapsed_channels")),
             "app_version": APP_VERSION,
             "paths": self.get_paths(),
             "load_error": _LAST_LOAD_ERROR[0],
@@ -7843,6 +7921,22 @@ class DesktopAPI:
         st["theme"] = str(theme_name or "obsidian")
         save_app_settings(st)
         return {"success": True, "theme": st["theme"]}
+
+    @js_safe
+    def set_collapsed_channels(self, channels):
+        """记住密钥分组的展开/收起状态。
+
+        channels = **处于「收起」状态**的分组 id 列表（各分组互相独立，
+        所以「有的开着有的关着」也能原样恢复）。传空列表 = 全部展开。
+        """
+        st = load_app_settings()
+        clean = _safe_str_list(channels)
+        if clean:
+            st["collapsed_channels"] = clean
+        else:
+            st.pop("collapsed_channels", None)
+        save_app_settings(st)
+        return {"success": True, "collapsed_channels": clean}
 
     # ---------- 数据源路径（开箱即用的关键：别人机器上的目录不一样） ----------
     @js_safe
@@ -8523,11 +8617,17 @@ class DesktopAPI:
             return {"error": str(e)}
 
 
+# WM_SETICON 传进去的图标句柄，**窗口不接管所有权** —— 调用方必须保证句柄在
+# 窗口存活期间一直有效。旧实现在设置完立刻 DestroyIcon，窗口于是指向一个已销毁的
+# 句柄，系统只能画一个空白占位图标（用户看到的就是「没 logo 了」）。
+# 所以这里故意**不释放**：这不是泄漏，是 Win32 的要求；进程退出时系统统一回收。
+_ICON_HANDLES = []
+
+
 def set_win32_window_icon(icon_path, title):
     """给窗口换上任务栏图标（pywebview 的 icon 参数在 Windows 上不生效）。"""
     if os.name != "nt":
         return
-    h_small = h_big = 0
     try:
         for _ in range(100):          # 最多等 8 秒，冷启动首次拉起 WebView2 会更慢
             time.sleep(0.08)
@@ -8546,18 +8646,26 @@ def set_win32_window_icon(icon_path, title):
                     ctypes.windll.user32.SendMessageW(hwnd, 128, 0, h_small)  # WM_SETICON, ICON_SMALL
                 if h_big:
                     ctypes.windll.user32.SendMessageW(hwnd, 128, 1, h_big)    # WM_SETICON, ICON_BIG
+                # 句柄必须留到进程结束 —— 见 _ICON_HANDLES 的说明
+                _ICON_HANDLES.extend(h for h in (h_small, h_big) if h)
             except Exception:
                 pass
             break
     except Exception:
         pass
-    finally:
-        # 句柄用完要释放，否则每次启动都漏两个 GDI 对象
-        try:
-            if h_small: ctypes.windll.user32.DestroyIcon(h_small)
-            if h_big: ctypes.windll.user32.DestroyIcon(h_big)
-        except Exception:
-            pass
+    # 有的 shell 在窗口首次激活时才会去读图标，隔一会儿再补一次更稳
+    try:
+        time.sleep(2.0)
+        hwnd = ctypes.windll.user32.FindWindowW(None, title)
+        if hwnd and _ICON_HANDLES:
+            small = _ICON_HANDLES[0]
+            big = _ICON_HANDLES[1] if len(_ICON_HANDLES) > 1 else small
+            ctypes.windll.user32.SendMessageW(hwnd, 128, 0, small)
+            ctypes.windll.user32.SendMessageW(hwnd, 128, 1, big)
+            # 让标题栏/任务栏立刻重画，不必等用户去点窗口
+            ctypes.windll.user32.RedrawWindow(hwnd, None, None, 0x0001 | 0x0080 | 0x0100)
+    except Exception:
+        pass
 
 
 def _fatal(msg):
