@@ -62,11 +62,24 @@ pwsh -File build.ps1
 
 | 数据源 | 默认位置 | 说明 |
 |---|---|---|
-| **DSH 账本** | `~/.dsh/storages/cost-meter/ledger.json`，或 `%APPDATA%\dsh`、`%LOCALAPPDATA%\DeepSeekHarness\data` 等 | DeepSeek Harness 的 cost-meter 账本。找不到就填你实际的 DSH 数据目录 |
+| **dsh 账本** | `<dsh_home>/storages/cost-meter/ledger.json` | 由 `dsh-cost-meter` 插件写入，**按日最精确** |
+| **dsh 会话缓存** | `<dsh_home>/storages/session_projcache/` | dsh 自带，**不需要任何插件**；账本不存在时自动用它兜底 |
 | **Grok 会话库** | `~/.grok/sessions` | Grok CLI / Grok Build 的会话目录 |
 | **opencode 本地库** | `~/.local/share/opencode/opencode.db`、`%APPDATA%\opencode\opencode.db` 等 | opencode 的 SQLite 库 |
 
-程序也会读取这些环境变量（有就优先用）：`DSH_HOME`、`DSH_DATA_DIR`、`DSH_PROFILE_DIR`、`GROK_HOME`、`OPENCODE_DATA`、`XDG_DATA_HOME`。
+`<dsh_home>` 的候选：`~/.dsh`、`%APPDATA%\dsh`、`%LOCALAPPDATA%\DeepSeekHarness\data`、`%LOCALAPPDATA%\dsh`、`<各盘符>:/DeepSeekHarness/data`。程序也会读取 `DSH_HOME`、`DSH_DATA_DIR`、`DSH_PROFILE_DIR`、`GROK_HOME`、`OPENCODE_DATA`、`XDG_DATA_HOME`。
+
+### 没装 dsh-cost-meter 插件也能用
+
+这是**重点适配过的场景**。dsh 的费用账本 `ledger.json` 是 `dsh-cost-meter` 插件写的；没装这个插件的机器上它不存在。
+
+旧版本此时本机用量全是 0。现在会自动回退到 **dsh 自己的会话缓存** `storages/session_projcache/`（里面每个会话都带 `costUsage`，字段结构与账本完全一致），因此：
+
+- **合计是准确的** —— token、缓存、费用都能算出来；
+- **按日归属是近似的** —— 以「会话创建日」为准，一个跨天的长会话会整段计入创建日；
+- 界面会用醒目的 **「dsh会话缓存」** 徽章和一行说明标注这一点，设置页也会显示「⚠ 未检测到 dsh-cost-meter 插件」。
+
+装了插件之后，程序会自动改用账本，按日数据就是精确的。
 
 **这些数据源全都是可选的。** 一个都没有也能正常用 —— 云端额度部分照样工作，本机用量部分会明确告诉你「未找到」，不会假装是 0。
 

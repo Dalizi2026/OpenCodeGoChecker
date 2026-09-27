@@ -8,7 +8,7 @@ Coding Plan 额度查询
 - 本地用量：dsh 账本、opencode 本地库、Grok 本机会话库（找不到就跳过，不报错）
 - 所有路径都自动探测，可在「设置 → 数据源路径」里手动指定
 """
-import json, os, sys, threading, time, urllib.request, urllib.error, sqlite3, re, shutil, math, copy
+import json, os, sys, threading, time, urllib.request, urllib.error, sqlite3, re, shutil, math, copy, functools
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -799,7 +799,14 @@ def _dsh_home_candidates():
     return uniq
 
 def _dsh_home_score(p):
-    """目录「像不像」真的 DSH 数据目录：有账本 2 分，有凭据 1 分，有 profiles 1 分。"""
+    """目录「像不像」真的 DSH 数据目录。
+
+    有账本 2 分（最权威）；有凭据 / profiles / settings.yaml / 会话缓存 各 1 分。
+    会话缓存必须计分：没装 cost-meter 插件的机器上，一个 dsh home 可能**只有**
+    storages/session_projcache —— 不计分的话它得 0 分，dsh_home() 的「显式指定」
+    分支会把它当成无效目录跳过，于是用户明明填了路径，程序却去读机器上另一个
+    dsh 目录的数据。
+    """
     score = 0
     try:
         if (p / "storages" / "cost-meter" / "ledger.json").exists():
@@ -809,6 +816,10 @@ def _dsh_home_score(p):
         if (p / "profiles").exists():
             score += 1
         if (p / "settings.yaml").exists():
+            score += 1
+        if (p / "storages" / "session_projcache").exists():
+            score += 1
+        elif (p / "storages" / "session_projcache.json").exists():
             score += 1
     except Exception:
         pass
@@ -984,7 +995,7 @@ def load_dsh_ledger(force=False, max_age=10.0):
             w = f"账本读取失败，使用缓存数据（{last_err}）"
             _LEDGER_CACHE["warn"] = w
             return _LEDGER_CACHE["data"], w
-    return None, f"读取 dsh 账本失败：{last_err}"
+    return None, f"读取 dsh 账本失败：{last_err}（文件：{p}）"
 
 _KEYMAP_CACHE = {"map": None, "at": 0.0, "err": ""}
 _KEYMAP_TTL = 300.0
@@ -1049,7 +1060,7 @@ def load_dsh_keymap(force=False):
                 data, _w = load_dsh_ledger()
                 if data is not None:
                     ledger_pids = set()
-                    for d in (data.get("days") or {}).values():
+                    for d in _ledger_days(data).values():
                         for pm in (d.get("byProviderModel") or {}):
                             ledger_pids.add(pm.split(":", 1)[0])
                     for env, key in refs.items():
@@ -1456,14 +1467,43 @@ def load_dsh_session_usage(force=False, max_age=_DSH_SESSION_MAX_AGE):
     return data, warn
 
 
+def _ledger_days(data):
+    """安全取出账本的 days 字典。
+
+    账本是外部文件（用户可能手改过、或插件版本变化），days 完全可能是 list /
+    None / 字符串。旧实现写的是 `data.get("days") or {}` —— 只有 None/空字典会
+    被兜住，一个 list 会在下游 .keys() 处抛 AttributeError，把整次查询打断。
+    """
+    if not isinstance(data, dict):
+        return {}
+    d = data.get("days")
+    return d if isinstance(d, dict) else {}
+
+
 def _load_dsh_any(force=False):
-    """账本优先，不存在则回退到会话缓存。返回 (data|None, warn, used_fallback)。"""
+    """账本优先，不存在或读不出来则回退到会话缓存。
+
+    返回 (data|None, note, used_fallback)。note 在成功时是「提示」，失败时是「错误」。
+    """
     data, warn = load_dsh_ledger(force=force)
     if data is not None:
         return data, warn, False
+    try:
+        ledger_exists = dsh_ledger_path().exists()
+    except Exception:
+        ledger_exists = False
     fb, fb_warn = load_dsh_session_usage(force=force)
     if fb is not None:
-        return fb, fb_warn, True
+        if ledger_exists and warn:
+            # 账本文件**在**，只是读不出来（截断 / 半截写入 / 权限）。
+            # 这时真正的错误是账本那条，绝不能被「未找到账本」顶掉 ——
+            # 否则界面会说「路径不对」，用户按提示去改路径也修不好。
+            note = "%s；已临时改用 dsh 会话缓存统计（按日归属以会话创建日为准）" % warn
+        else:
+            note = fb_warn
+        return fb, note, True
+    if ledger_exists:
+        return None, warn, False
     return None, (fb_warn or warn), False
 
 
@@ -1478,7 +1518,7 @@ def dsh_usage(providers=None, time_key="全部", force=False):
         return {"error": warn, "totals": None, "per_model": [],
                 "source": "dsh", "hint": warn,
                 "db": str(dsh_ledger_path()), "daily_series": []}
-    days = data.get("days") or {}
+    days = _ledger_days(data)
     day_keys = _day_keys_for(list(days.keys()), time_key)
     if providers is not None and not providers:
         # 明确给了空列表 = 该 Key 未映射到任何 provider，结果必须为 0 而不是"全部"
@@ -1582,7 +1622,7 @@ def stepfun_estimate(providers=None, month=None):
         return {"error": warn, "credit_used": 0, "credit_used_m": 0.0,
                 "unpriced_tokens": 0, "per_model": [], "source": "dsh"}
     month = month or datetime.now().strftime("%Y-%m")
-    days = data.get("days") or {}
+    days = _ledger_days(data)
     day_keys = [k for k in sorted(days.keys()) if k.startswith(month)]
     if providers is not None and not providers:
         return {"credit_used": 0, "credit_used_m": 0.0, "unpriced_tokens": 0,
@@ -7206,6 +7246,7 @@ def js_safe(fn):
     resolve/reject 之前 —— Promise 永不 settle，按钮永远回不来。
     同时把未预期异常转成 {"error": ...}，避免整个调用无声消失。
     """
+    @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         try:
             return _json_safe(fn(*args, **kwargs))
@@ -7217,7 +7258,7 @@ def js_safe(fn):
             except Exception:
                 pass
             return {"error": "内部错误：%s" % e}
-    wrapper.__name__ = getattr(fn, "__name__", "api")
+    wrapper._js_safe = True
     return wrapper
 
 
