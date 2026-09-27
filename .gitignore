@@ -1,0 +1,40 @@
+# ---------- 密钥与个人数据：绝对不要提交 ----------
+# 程序把密钥写在 %APPDATA%\OpenCodeGoChecker\，正常不会出现在仓库里；
+# 下面这些规则是第二道防线，防止误存/误拷进来。
+opencode_go_keys.json
+opencode_go_keys.json.*
+opencode_go_keys*.bak
+*.bak
+*.tmp
+app_settings.json
+fx_cache.json
+grok_usage_archive.json
+startup.log
+*.corrupt-*
+
+# ---------- 构建产物 ----------
+build/
+dist/
+*.spec.bak
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---------- 本地环境 ----------
+.env
+.env.*
+*.local
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---------- 临时/调试 ----------
+scratch/
+_probe/
+*.log
+*.png
+!assets/*.png

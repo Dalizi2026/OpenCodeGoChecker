@@ -1,0 +1,8 @@
+# 运行依赖（源码方式启动）
+# 注意：pywebview 在 Windows 上依赖 .NET / WebView2，见 README「运行要求」
+
+pywebview>=5.0,<7.0
+PyYAML>=6.0
+
+# 打包 exe 时额外需要（可选）
+# pyinstaller>=6.0

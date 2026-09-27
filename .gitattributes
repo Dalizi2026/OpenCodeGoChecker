@@ -1,0 +1,12 @@
+# 统一换行：仓库内存 LF，检出到 Windows 时由 git 自行处理
+* text=auto eol=lf
+
+# 二进制资源不要做换行转换
+*.ico binary
+*.png binary
+*.exe binary
+
+# 让 GitHub 正确识别语言统计
+*.py   text
+*.ps1  text
+*.yml  text

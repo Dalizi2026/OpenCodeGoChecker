@@ -1,0 +1,61 @@
+name: build-release
+
+# 打 tag（如 v3.0.0）时自动构建 Windows exe 并发布 Release；
+# 也可以在 Actions 页面手动触发，只产出 artifact 不发布。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: 语法自检
+        run: python -c "import ast,pathlib; ast.parse(pathlib.Path('opencode_go_checker.py').read_text(encoding='utf-8')); print('syntax OK')"
+
+      - name: 密钥泄露自检（构建前拦截）
+        run: python tools/check_secrets.py --strict
+
+      - name: 打包 exe
+        run: python -m PyInstaller --noconfirm --clean OpenCodeGoChecker.spec
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenCodeGoChecker-windows-x64
+          path: dist/OpenCodeGoChecker.exe
+          if-no-files-found: error
+
+      - name: 发布 Release（仅打 tag 时）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/OpenCodeGoChecker.exe
+          generate_release_notes: true
+          body: |
+            Windows 单文件版，下载后双击即可运行，无需安装 Python。
+
+            **运行要求**：Windows 10/11（需要 Microsoft Edge WebView2 运行时，Win11 自带）。
+
+            首次运行没有任何密钥，点左侧「+」添加即可。
+            本机用量需要 dsh / Grok / opencode 数据目录，路径可在「设置 → 数据源路径」里指定。
