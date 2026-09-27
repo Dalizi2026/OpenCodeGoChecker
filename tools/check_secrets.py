@@ -21,6 +21,15 @@ import re
 import subprocess
 import sys
 
+# 输出含中文。Windows 上 Python 的 stdout 默认可能是 cp1252（GitHub Actions 的
+# windows-latest runner 就是这样），打印中文会直接抛 UnicodeEncodeError 让脚本崩掉
+# —— 而这一步是 CI 的构建前拦截，崩了会让整个流水线红掉，看起来像「发现了密钥」。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ---------- 1. 敏感文件名 ----------
