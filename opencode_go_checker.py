@@ -867,28 +867,22 @@ def dsh_home():
     return best
 
 def dsh_ledger_path():
-    """账本 = <home>/storages/cost-meter/ledger.json，在候选目录里取第一个真实存在的"""
-    cands = _dsh_home_candidates()
-    for p in cands:
-        f = p / "storages" / "cost-meter" / "ledger.json"
-        try:
-            if f.exists():
-                return f
-        except Exception:
-            pass
-    return cands[0] / "storages" / "cost-meter" / "ledger.json"
+    """账本 = <dsh_home()>/storages/cost-meter/ledger.json。
+
+    **只认 dsh_home() 选中的那个目录**，不再去别的候选里「顺手找一个」。
+    旧实现是「候选里任意一个存在就返回」，于是会出现「设置页显示用的是 A 目录、
+    实际读的却是 B 目录的账本」这种自相矛盾。而 dsh_home() 的评分本身已经把
+    「有账本」的目录排在「只有凭据」的前面，所以正常机器上不会挑错。
+    选中的目录里确实没有账本时，上层会自动回退到会话缓存数据源。
+    """
+    return dsh_home() / "storages" / "cost-meter" / "ledger.json"
 
 def _dsh_credentials_path():
-    """凭据库 <home>/.credentials.yaml（新版仍在 home 根，格式未变：refs: {ENV名: 值}）"""
-    cands = _dsh_home_candidates()
-    for p in cands:
-        f = p / ".credentials.yaml"
-        try:
-            if f.exists():
-                return f
-        except Exception:
-            pass
-    return cands[0] / ".credentials.yaml"
+    """凭据库 = <dsh_home()>/.credentials.yaml（新版仍在 home 根，格式未变：refs: {ENV名: 值}）
+
+    同样只认 dsh_home()，保持与账本、设置页显示一致。
+    """
+    return dsh_home() / ".credentials.yaml"
 
 def _dsh_provider_config_paths():
     """provider 定义来源：
@@ -1276,11 +1270,214 @@ def get_fx(force=False):
         pass
     return FX_DEFAULT
 
-def dsh_usage(providers=None, time_key="全部", force=False):
-    """dsh 账本用量。providers=None → 全部渠道。"""
+# ---------- dsh 会话缓存回退数据源（未安装 dsh-cost-meter 插件时） ----------
+# 背景：账本 ledger.json 是 dsh-cost-meter 插件写的。别人机器上没装这个插件时，
+# 账本不存在 —— 但 dsh 自己仍然会在 storages/session_projcache/ 里缓存每个会话的
+# 用量与费用（costUsage，字段结构与账本 byProviderModel 完全一致）。
+# 这里直接聚合它，做到「没有费用插件也能用统计」，而不是干巴巴显示 0。
+_DSH_SESSION_CACHE = {"at": 0.0, "home": "", "data": None, "warn": "", "meta": {}}
+_DSH_SESSION_LOCK = threading.RLock()
+_DSH_SESSION_MAX_FILES = 6000
+_DSH_SESSION_MAX_AGE = 60.0
+
+def cost_meter_installed():
+    """dsh-cost-meter 插件是否安装（新版 desktop 装在 profiles/<profile>/node_modules）。"""
+    home = dsh_home()
+    try:
+        prof = home / "profiles"
+        if prof.exists():
+            for d in prof.iterdir():
+                try:
+                    if (d / "node_modules" / "dsh-cost-meter").exists():
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    for cand in (home / "dsh-plugins" / "dsh-cost-meter",
+                 home / "dsh-plugins" / "cost-meter"):
+        try:
+            if cand.exists():
+                return True
+        except Exception:
+            pass
+    return False
+
+def _session_day(created_at_ms):
+    """会话创建时间 → UTC 日期。用 UTC 是为了和账本的日桶口径保持一致。"""
+    try:
+        ts = _safe_float(created_at_ms) / 1000.0
+        if ts <= 0:
+            return ""
+        return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+def _read_session_record(path):
+    """读单个会话缓存文件，返回 record 字典（带 mtime 缓存）。"""
+    try:
+        st = path.stat()
+        sig = (st.st_mtime, st.st_size)
+    except Exception:
+        return None
+    key = str(path)
+    with _DSH_SESSION_LOCK:
+        cached = _DSH_SESSION_CACHE.setdefault("_files", {}).get(key)
+        if cached and cached[0] == sig:
+            return cached[1]
+    rec = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            doc = _safe_json_loads(f.read())
+        if isinstance(doc, dict):
+            rec = doc.get("record") if isinstance(doc.get("record"), dict) else doc
+    except Exception:
+        rec = None
+    with _DSH_SESSION_LOCK:
+        files = _DSH_SESSION_CACHE.setdefault("_files", {})
+        if len(files) > _DSH_SESSION_MAX_FILES * 2:
+            files.clear()
+        files[key] = (sig, rec)
+    return rec
+
+def _collect_session_records(home):
+    """返回 (records, warn)。优先用逐会话目录；没有再退回聚合大文件。"""
+    sess_dir = home / "storages" / "session_projcache" / "sessions"
+    agg_file = home / "storages" / "session_projcache.json"
+    records, warn = [], ""
+    if sess_dir.exists():
+        try:
+            paths = []
+            for p in sess_dir.glob("*.json"):
+                paths.append(p)
+                if len(paths) >= _DSH_SESSION_MAX_FILES:
+                    warn = "会话缓存文件超过 %d 个，只统计了前 %d 个" % (_DSH_SESSION_MAX_FILES, _DSH_SESSION_MAX_FILES)
+                    break
+            for p in paths:
+                rec = _read_session_record(p)
+                if isinstance(rec, dict):
+                    records.append(rec)
+        except Exception as e:
+            warn = "读取 dsh 会话缓存目录失败：%s" % e
+    if not records and agg_file.exists():
+        try:
+            with open(agg_file, "r", encoding="utf-8") as f:
+                doc = _safe_json_loads(f.read())
+            tables = (doc or {}).get("tables") if isinstance(doc, dict) else None
+            sess = (tables or {}).get("sessions") if isinstance(tables, dict) else None
+            if isinstance(sess, dict):
+                for rec in sess.values():
+                    if isinstance(rec, dict):
+                        records.append(rec)
+        except Exception as e:
+            warn = "读取 dsh 会话缓存汇总文件失败：%s" % e
+    return records, warn
+
+def load_dsh_session_usage(force=False, max_age=_DSH_SESSION_MAX_AGE):
+    """把 dsh 会话缓存聚合成与 ledger.json 的 days 同构的结构。
+
+    返回 (data|None, warn)。data = {"days": {...}, "config": {...}}，可直接喂给
+    _agg_by_provider_model，所以 dsh_usage() 的上层逻辑一行都不用改。
+    """
+    home = dsh_home()
+    now = time.time()
+    with _DSH_SESSION_LOCK:
+        if (not force and _DSH_SESSION_CACHE["data"] is not None
+                and _DSH_SESSION_CACHE["home"] == str(home)
+                and (now - _DSH_SESSION_CACHE["at"]) < max_age):
+            return _DSH_SESSION_CACHE["data"], _DSH_SESSION_CACHE["warn"]
+
+    records, warn = _collect_session_records(home)
+    if not records:
+        msg = ("未找到 dsh 账本，也没找到 dsh 会话缓存。"
+               "若你的 dsh 数据目录不在默认位置，请在「设置 → 数据源路径」里指定。")
+        return None, (warn + "；" + msg) if warn else msg
+
+    days = {}
+    n_cost = 0
+    undated = 0
+    for rec in records:
+        rows = rec.get("rows") if isinstance(rec.get("rows"), dict) else {}
+        cu = (rows.get("costUsage") or {}) if isinstance(rows.get("costUsage"), dict) else {}
+        val = cu.get("val") if isinstance(cu.get("val"), dict) else None
+        if not val:
+            continue
+        bpm = val.get("byProviderModel")
+        if not isinstance(bpm, dict) or not bpm:
+            continue
+        ident = rec.get("identity") if isinstance(rec.get("identity"), dict) else {}
+        day = _session_day(ident.get("createdAt"))
+        if not day:
+            undated += 1
+            continue
+        d = days.setdefault(day, {"date": day, "input": 0, "output": 0, "cacheRead": 0,
+                                  "cacheWrite": 0, "reasoning": 0, "calls": 0, "cost": 0.0,
+                                  "apiCost": 0.0, "byProviderModel": {}})
+        for pm, v in bpm.items():
+            if not isinstance(v, dict):
+                continue
+            a = d["byProviderModel"].setdefault(pm, {"input": 0, "output": 0, "cacheRead": 0,
+                                                     "cacheWrite": 0, "reasoning": 0,
+                                                     "calls": 0, "cost": 0.0, "apiCost": 0.0})
+            for fld in ("input", "output", "cacheRead", "cacheWrite", "reasoning"):
+                a[fld] += _safe_int(v.get(fld))
+            c = _safe_float(v.get("cost"))
+            a["cost"] += c
+            a["apiCost"] += c
+            a["calls"] += _safe_int(v.get("calls")) or 1
+        n_cost += 1
+    if not days:
+        return None, "dsh 会话缓存里没有可用的用量记录（costUsage 为空）"
+
+    for d in days.values():
+        for fld in ("input", "output", "cacheRead", "cacheWrite", "reasoning", "calls"):
+            d[fld] = sum(a[fld] for a in d["byProviderModel"].values())
+        d["cost"] = round(sum(a["cost"] for a in d["byProviderModel"].values()), 8)
+        d["apiCost"] = d["cost"]
+
+    data = {"version": 1, "days": days, "config": {},
+            "_source": "session_projcache"}
+    notes = []
+    if warn:
+        notes.append(warn)
+    notes.append("未检测到 dsh-cost-meter 插件，已回退到 dsh 会话缓存统计"
+                 "（%d 个会话，其中 %d 个含费用）" % (len(records), n_cost))
+    notes.append("按日归属以「会话创建日」为准：跨天会话会整段计入创建日，"
+                 "安装 dsh-cost-meter 插件后按日数据才精确")
+    if undated:
+        notes.append("%d 个会话没有创建时间，未纳入按日统计" % undated)
+    warn = "；".join(notes)
+
+    with _DSH_SESSION_LOCK:
+        _DSH_SESSION_CACHE.update({"at": now, "home": str(home), "data": data,
+                                   "warn": warn,
+                                   "meta": {"records": len(records), "with_cost": n_cost,
+                                            "undated": undated}})
+    return data, warn
+
+
+def _load_dsh_any(force=False):
+    """账本优先，不存在则回退到会话缓存。返回 (data|None, warn, used_fallback)。"""
     data, warn = load_dsh_ledger(force=force)
+    if data is not None:
+        return data, warn, False
+    fb, fb_warn = load_dsh_session_usage(force=force)
+    if fb is not None:
+        return fb, fb_warn, True
+    return None, (fb_warn or warn), False
+
+
+def dsh_usage(providers=None, time_key="全部", force=False):
+    """dsh 账本用量。providers=None → 全部渠道。
+
+    账本不存在时（最常见的原因：没装 dsh-cost-meter 插件）自动回退到
+    dsh 自己的会话缓存，保证「没有费用插件也能用统计」。
+    """
+    data, warn, fallback = _load_dsh_any(force=force)
     if data is None:
-        return {"error": warn, "totals": None, "per_model": [], "source": "dsh"}
+        return {"error": warn, "totals": None, "per_model": [],
+                "source": "dsh", "hint": warn,
+                "db": str(dsh_ledger_path()), "daily_series": []}
     days = data.get("days") or {}
     day_keys = _day_keys_for(list(days.keys()), time_key)
     if providers is not None and not providers:
@@ -1343,22 +1540,33 @@ def dsh_usage(providers=None, time_key="全部", force=False):
             "calls": d_calls
         })
 
-    out = {"per_model": per_model, "totals": totals, "error": warn, "source": "dsh",
+    out = {"per_model": per_model, "totals": totals, "error": None,
+           "source": ("dsh-sessions" if fallback else "dsh"),
            "db": str(dsh_ledger_path()), "days": len(day_keys), "daily_series": daily_series}
+    if fallback:
+        # 注意：这是「提示」不是「错误」。前端只要看到 error 就会清空面板，
+        # 把回退说明塞进 error 会让数据明明算出来了却显示空白。
+        out["fallback"] = True
+        out["db"] = str(dsh_home() / "storages" / "session_projcache")
+        out["hint"] = (str(out.get("hint")) + "；" + str(warn)) if out.get("hint") else str(warn)
+    elif warn:
+        out["error"] = warn
     # 账本新鲜度：dsh-cost-meter 插件停跑时账本会「静默停更」——数字不会变，但看不出原因。
     # 这里显式提示最后记录日，避免把陈旧数据误当成实时数据。
-    try:
-        _all_days = sorted(days.keys())
-        if _all_days:
-            last_day = _all_days[-1]
-            today = datetime.now().strftime("%Y-%m-%d")
-            if last_day < today:
-                stale = f"账本最后记录 {last_day}（今日 {today} 无新数据）：dsh-cost-meter 插件可能未运行"
-                out["stale"] = True
-                out["last_day"] = last_day
-                out["hint"] = (str(out.get("hint")) + "；" + stale) if out.get("hint") else stale
-    except Exception:
-        pass
+    # （回退模式下不适用：会话缓存的按日归属本来就不是精确的，已在 hint 里说明。）
+    if not fallback:
+        try:
+            _all_days = sorted(days.keys())
+            if _all_days:
+                last_day = _all_days[-1]
+                today = datetime.now().strftime("%Y-%m-%d")
+                if last_day < today:
+                    stale = f"账本最后记录 {last_day}（今日 {today} 无新数据）：dsh-cost-meter 插件可能未运行"
+                    out["stale"] = True
+                    out["last_day"] = last_day
+                    out["hint"] = (str(out.get("hint")) + "；" + stale) if out.get("hint") else stale
+        except Exception:
+            pass
     if providers is not None and not per_model and not warn:
         if not providers:
             _msg = "该 Key 未在 dsh 配置中使用（统计为 0）"
@@ -1369,7 +1577,7 @@ def dsh_usage(providers=None, time_key="全部", force=False):
 
 def stepfun_estimate(providers=None, month=None):
     """StepFun Step Plan 月池估算：tokens × 官方价格 = Credit（1M Credit = ¥1，月末清零）"""
-    data, warn = load_dsh_ledger()
+    data, warn, _fb = _load_dsh_any()
     if data is None:
         return {"error": warn, "credit_used": 0, "credit_used_m": 0.0,
                 "unpriced_tokens": 0, "per_model": [], "source": "dsh"}
@@ -1407,6 +1615,10 @@ def stepfun_estimate(providers=None, month=None):
         hint = "该 Key 在 dsh 账本中本月没有使用记录"
     elif credit <= 0 and unpriced > 0:
         hint = "本月有 " + format_tokens(unpriced) + " tokens，但所用模型不在价格表中，Credit 估算为 0"
+    if _fb:
+        # 回退说明是「提示」不是「错误」：数据算出来了就别让前端当成失败
+        hint = (str(hint) + "；" + str(warn)) if hint else str(warn)
+        warn = None
     return {"credit_used": credit, "credit_used_m": credit / 1e6, "unpriced_tokens": unpriced,
             "per_model": detail, "month": month, "error": warn, "source": "dsh", "hint": hint}
 
@@ -5437,11 +5649,14 @@ async function loadTokenStats(overrideTimeKey) {
 
         const res = await apiCall('get_token_stats', [timeKey, 'dsh 账本', onlyKey, currentKeyIndex, currentKeyStr], 150000);
         if (reqId !== _loadTokenStatsReqId) return;
-        if (res && res.error) {
+        // 只有「确实没有数据」才清空面板。带 totals 的警告（例如未装
+        // dsh-cost-meter 插件而走了会话缓存回退）必须照常渲染，只是把说明显示出来。
+        if (res && res.error && !(res.totals || (res.per_model && res.per_model.length))) {
             if (hintEl) hintEl.innerText = res.error;
             try { renderLeaderboard([]); } catch (e) {}
             return;
         }
+        if (res && res.error && hintEl) hintEl.innerText = res.error;
 
         // 无论数据是否为空，都明确刷新或清空 4 个 KPI 卡片，彻底杜绝残留上一个 Key 的数据！
         const t = (res && res.totals) ? res.totals : { sessions: 0, tokens: 0, tokens_with_cache: 0, cache: 0, cost: 0.0, fx: 7.2 };
@@ -5486,6 +5701,10 @@ async function loadTokenStats(overrideTimeKey) {
             } else if (res && res.source === 'cline-official') {
                 badge.innerText = 'Cline官网';
                 badge.title = '统计数据来源：Cline 官方接口（api.cline.bot/users/{id}/usages），含所有客户端与缓存明细，与官网图表同口径';
+            } else if (res && res.source === 'dsh-sessions') {
+                badge.innerText = 'dsh会话缓存';
+                badge.title = '未检测到 dsh-cost-meter 插件，已回退到 dsh 自己的会话缓存（storages/session_projcache）。'
+                            + '合计准确；「按日」以会话创建日归属，跨天会话会整段计入创建日。';
             } else {
                 badge.innerText = 'dsh账本';
                 badge.title = '统计数据来源：本地 OpenCode / dsh 账本数据';
@@ -6483,8 +6702,15 @@ function renderPathsPanel() {
     const p = (appState && appState.paths) || {};
     const box = document.getElementById('paths-status');
     if (box) {
+        const cm = p.cost_meter || {};
+        const cmRow = cm.installed
+            ? `<div style="color:#22c55e;">✓ dsh-cost-meter 插件已安装（按日费用精确）</div>`
+            : `<div style="color:#f59e0b;">⚠ 未检测到 dsh-cost-meter 插件 —— 将回退到 dsh 会话缓存统计：`
+              + `合计准确，但「按日」以会话创建日归属，跨天会话会整段计入创建日</div>`;
         box.innerHTML =
+            cmRow +
             _pathRow('DSH 账本', p.dsh_ledger) +
+            _pathRow('会话缓存', p.session_cache) +
             _pathRow('Grok 会话库', p.grok_home) +
             _pathRow('opencode 库', p.opencode_db) +
             (p.env_dsh_home ? `<div style="color:#64748b;font-size:10.5px;">环境变量 DSH_HOME = ${esc(p.env_dsh_home)}</div>` : '');
@@ -7065,6 +7291,12 @@ class DesktopAPI:
             out["dsh_ledger"] = info(ledger, ledger.exists())
         except Exception:
             out["dsh_ledger"] = {"path": "", "found": False}
+        try:
+            _sp = dsh_home() / "storages" / "session_projcache"
+            out["session_cache"] = info(_sp, _sp.exists())
+        except Exception:
+            out["session_cache"] = {"path": "", "found": False}
+        out["cost_meter"] = {"installed": cost_meter_installed()}
         out["env_dsh_home"] = os.getenv("DSH_HOME") or os.getenv("DSH_DATA_DIR") or ""
         return out
 
@@ -7086,6 +7318,9 @@ class DesktopAPI:
         _KEYMAP_CACHE.update({"map": None, "at": 0.0, "err": ""})
         _GROK_CACHE["at"] = 0.0
         _GROK_SCAN_CACHE.clear()
+        with _DSH_SESSION_LOCK:
+            _DSH_SESSION_CACHE.update({"at": 0.0, "home": "", "data": None, "warn": ""})
+            _DSH_SESSION_CACHE["_files"] = {}
         GROK_SESSIONS_DIR = _grok_sessions_dir()
         return {"success": True, "paths": self.get_paths()}
 
@@ -7593,6 +7828,14 @@ class DesktopAPI:
                 else:
                     return query_token_stats(time_key)
             else:
+                # 「仅当前 Key」但没有可选的 Key。
+                # 一个 Key 都没有时退化成全渠道汇总 —— 否则新用户（还没添加任何
+                # 密钥，但本机已经有 dsh 数据）永远看到 0，会以为工具坏了。
+                if not self.keys:
+                    allview = dsh_usage(None, time_key) if source.startswith("dsh") else query_token_stats(time_key)
+                    allview["hint"] = ("还没有添加任何密钥，当前显示的是本机全部渠道用量。"
+                                       "点左上角「+」添加密钥后可只看单个 Key。")
+                    return allview
                 return dsh_usage([], time_key) if source.startswith("dsh") else query_token_stats(time_key)
 
         # 2. 未勾选“仅当前 Key”：全渠道总览（深度合并 dsh 账本与 Grok Build 本地会话）
