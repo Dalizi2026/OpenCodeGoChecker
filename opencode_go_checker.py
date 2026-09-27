@@ -5212,6 +5212,12 @@ function renderResultData(data, item) {
     }
 }
 
+/* 没有数据时把「原始技术回执」恢复成占位提示，避免残留上一个 Key 的 JSON */
+function resetRawJsonPane() {
+    const pre = document.getElementById('raw-json-pre');
+    if (pre) pre.innerText = '暂无数据，点击上方“立即查询”获取最新额度。';
+}
+
 function formatCountdown(resetsAt) {
     if (!resetsAt) return '-- 后重置';
     const target = new Date(resetsAt).getTime();
@@ -5888,6 +5894,7 @@ function clearTokenStatsPanels() {
     try { renderKpiCost(_lastTotals); } catch (e) {}
     try { _trendData = []; updateTrendSummary(); drawTrendChart(); } catch (e) {}
     try { renderLeaderboard([]); } catch (e) {}
+    try { resetRawJsonPane(); } catch (e) {}
     const badge = document.getElementById('stats-ledger-badge');
     if (badge) { badge.innerText = '—'; badge.title = '暂无密钥'; }
     const hintEl = document.getElementById('stats-hint');
@@ -6592,6 +6599,14 @@ function copyModelTable() {
 
 function copyRawJson() {
     const text = document.getElementById('raw-json-pre').innerText;
+    // 没有数据时 pre 里是占位提示文案，直接复制会「复制了一段中文还提示成功」。
+    // 判据：内容必须能当 JSON 解析。
+    let ok = false;
+    try { JSON.parse(text); ok = true; } catch (e) { ok = false; }
+    if (!ok) {
+        showToast('当前没有原始数据可复制，请先点「立即查询」', 'warning');
+        return;
+    }
     copyText(text, '已复制 JSON 到剪贴板');
 }
 
@@ -7077,11 +7092,17 @@ async function moveCurrentKey(direction) {
     const keyStr = it ? (it.key || '') : '';
     const res = await apiCall('move_key', [currentKeyIndex, direction, keyStr], 20000);
     if (res && res.success) {
+        const moved = res.new_index !== currentKeyIndex;
         appState.keys = res.keys || appState.keys;
         currentKeyIndex = res.new_index;
         renderKeyList();
         selectKey(currentKeyIndex);
-        showToast(direction === 'up' ? '已上移密钥' : (direction === 'down' ? '已下移密钥' : '已置顶密钥'), 'success', 1200);
+        if (!moved) {
+            // 已在首/末位时顺序不变，不能再提示「已上移/已置顶」——那是假成功
+            showToast(direction === 'down' ? '已经在最后一位了' : '已经在最前面了', 'info', 1500);
+        } else {
+            showToast(direction === 'up' ? '已上移密钥' : (direction === 'down' ? '已下移密钥' : '已置顶密钥'), 'success', 1200);
+        }
     } else if (res && res.error) {
         showToast(res.error, 'warning', 1500);
     } else {
