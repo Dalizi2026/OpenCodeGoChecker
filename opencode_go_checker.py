@@ -1276,6 +1276,11 @@ def _build_dsh_keymap(now):
                         if not key or key in keymap:
                             continue
                         norm = env.lower()
+                        # 同一个 provider 配多把密钥时，dsh 常见写法是
+                        # NAME_API_KEY_2 / NAME_API_KEY_3。先把结尾的序号摘掉，
+                        # 否则 norm 变成 commandcode-api-key-2，永远匹配不上
+                        # 账本里的 commandcode —— 表现为「第二把密钥用量恒为 0」。
+                        norm = re.sub(r"_\d+$", "", norm)
                         for suffix in ("_api_key", "_key"):
                             if norm.endswith(suffix):
                                 norm = norm[: -len(suffix)]
