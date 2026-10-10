@@ -10,7 +10,7 @@
 
 一个 Windows 桌面小工具，把你在各家 AI 编程订阅里的**额度窗口**和**本机 token 消耗**汇总到一个界面里。
 
-- **云端额度**：OpenCode Go（opencode zen）、Command Code、Cline Pass、阶跃星辰 StepFun、Grok Build
+- **云端额度**：OpenCode Go（opencode zen）、Command Code、Cline Pass、阶跃星辰 StepFun、Grok Build、Factory (Droid)｜双池
 - **本机用量**：dsh 账本（`ledger.json`）、Grok 本机会话库、opencode 本地库
 - 单文件 exe、双击即用、无需安装 Python
 - 密钥只存在你自己的电脑上（`%APPDATA%\OpenCodeGoChecker\`），不经过任何第三方服务器
@@ -59,6 +59,38 @@ pwsh -File build.ps1
 | Cline Pass | cline.bot 账户页 |
 | 阶跃星辰 StepFun | platform.stepfun.com |
 | Grok Build | **不需要 Key** —— 它读你本机的 Grok 登录态和会话库 |
+| Factory (Droid) | `fk-` 开头的 API Key。装了 `dsh-factory-provider` 插件的话，选这个渠道时会**自动从本机读出来** |
+| 小米 MiMo | platform.xiaomimimo.com 的 API Key（**只能看用量，查不了余额**，原因见下） |
+
+### Factory：两个池
+
+Factory 的订阅额度分**标准池**和 **Core 池**，程序会把两个池并排显示在同一张卡里：
+
+```
+┌─ 每月窗口 ───────────────┐
+│ 标准池  ▓▓▓▓▓▓▓▓░░  50% │
+│ Core池  ░░░░░░░░░░   0% │
+│ 本机用量 12.3M · 45 次    │
+└──────────────────────────┘
+```
+
+数据来自 `api.factory.ai/api/billing/limits`，用的是和推理同一把 key。
+
+### 小米：为什么查不了余额
+
+小米**没有开放「用 API Key 查余额」**这个能力。实测：
+
+| 请求 | 结果 |
+|---|---|
+| `platform.xiaomimimo.com/api/v1/balance` + `Bearer <key>` | **401**，跳转小米账号登录页 |
+| `api.xiaomimimo.com/v1/balance` | **404**，接口不存在 |
+| `api.xiaomimimo.com/v1/models` + `Bearer <key>` | 200（key 本身有效） |
+
+官方后台走的是**浏览器 Cookie**（`serviceToken`，会过期），第三方工具（[MiMoMoney](https://github.com/why-qw1ko/MiMoMoney)、cc-switch）也一律用 Cookie 登录。
+
+所以这里**只做用量归属**：把 dsh 账本里 `xiaomi` 渠道的用量算给你看。余额请到
+[platform.xiaomimimo.com](https://platform.xiaomimimo.com) 查看 —— 与其放一个一两天就失效的
+Cookie 输入框，不如不做。
 
 ---
 

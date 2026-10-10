@@ -199,11 +199,39 @@ CHANNEL_STEPFUN = "stepfun"
 CHANNEL_COMMANDCODE = "commandcode"
 CHANNEL_GROK = "grok-build"
 CHANNEL_CLINE = "cline"
+CHANNEL_FACTORY = "factory"
+CHANNEL_XIAOMI = "xiaomi"
 CHANNEL_LABELS = {CHANNEL_OPENCODE: "OpenCode Go", CHANNEL_STEPFUN: "阶跃星辰 StepFun",
                   CHANNEL_COMMANDCODE: "Command Code", CHANNEL_GROK: "Grok Build",
-                  CHANNEL_CLINE: "Cline Pass"}
+                  CHANNEL_CLINE: "Cline Pass", CHANNEL_FACTORY: "Factory (Droid)",
+                  CHANNEL_XIAOMI: "小米 MiMo"}
 CHANNEL_SHORT  = {CHANNEL_OPENCODE: "Go", CHANNEL_STEPFUN: "阶跃", CHANNEL_COMMANDCODE: "CC",
-                  CHANNEL_GROK: "Grok", CHANNEL_CLINE: "Cline"}
+                  CHANNEL_GROK: "Grok", CHANNEL_CLINE: "Cline", CHANNEL_FACTORY: "Factory",
+                  CHANNEL_XIAOMI: "MiMo"}
+
+# ---------- Factory (Droid) ----------
+# 额度来自订阅账单端点，和推理用的是同一把 fk- key（该插件作者 2026-10-03 实测确认，
+# 本程序 2026-10-10 也复现了）。响应里**两个池**：standard（标准池）与 core（Core 池），
+# 各自带 fiveHour / weekly / monthly 三个窗口。
+FACTORY_BASE = "https://api.factory.ai"
+FACTORY_BILLING_PATH = "/api/billing/limits"
+# 官方 CLI 客户端的固定标识。缺这两个头会拿不到数据（照抄 dsh-factory-provider 的做法）
+FACTORY_CLIENT_VERSION = "0.231.0"
+FACTORY_CLIENT_NAME = "cli"
+FACTORY_WINDOW_KEYS = (("fiveHour", "5小时窗口"), ("weekly", "每周窗口"), ("monthly", "每月窗口"))
+_FACTORY_CACHE = {"at": 0.0, "key": "", "data": None, "err": ""}
+_FACTORY_CACHE_LOCK = threading.RLock()
+_FACTORY_CACHE_TTL = 60.0
+
+# ---------- 小米 MiMo ----------
+# 小米**没有**「用 API Key 查余额」这个能力（2026-10-10 实测）：
+#   platform.xiaomimimo.com/api/v1/balance  + Bearer key → 401，跳 account.xiaomi.com 登录
+#   api.xiaomimimo.com/v1/balance                        → 404，接口不存在
+#   api.xiaomimimo.com/v1/models          + Bearer key   → 200（key 本身有效）
+# 官方后台是浏览器 Cookie 鉴权（serviceToken，会过期），第三方工具（MiMoMoney、
+# cc-switch）也一律走 Cookie。所以这里**只做用量归属**（读 dsh 账本里的 xiaomi
+# provider），不做余额查询 —— 与其放一个天天失效的 Cookie 输入框，不如不做。
+XIAOMI_BASE = "https://api.xiaomimimo.com/v1"
 
 # ---------- Cline（cline.bot / Cline Pass）----------
 CLINE_BASE = "https://api.cline.bot"
@@ -426,6 +454,33 @@ def save_app_settings(settings):
         return True
     except Exception:
         return False
+
+def _channel_code(raw):
+    """把用户/前端传来的渠道名归一成渠道常量；**认不出来就返回空串**。
+
+    旧实现把「认不出来」静默当成 opencode-go，于是新增渠道（Factory / 小米）
+    加进来时，Key 会被悄悄记成 Go 渠道 —— 查额度打到错误的上游、报 401，
+    而界面上看不出任何异常。这一类静默回退必须由调用方显式处理成报错。
+    """
+    s = str(raw or "").strip().lower()
+    if not s:
+        return ""
+    if s in (CHANNEL_GROK, "grok", "grok-build", "grokbuild"):
+        return CHANNEL_GROK
+    if s in (CHANNEL_COMMANDCODE, "command code", "commandcode", "cc", "command"):
+        return CHANNEL_COMMANDCODE
+    if s in (CHANNEL_CLINE, "cline", "cline pass", "clinepass", "cline-pass"):
+        return CHANNEL_CLINE
+    if s in (CHANNEL_STEPFUN, "阶跃", "阶跃星辰", "stepfun", "step"):
+        return CHANNEL_STEPFUN
+    if s in (CHANNEL_FACTORY, "factory", "factory (droid)", "droid", "factory-droid"):
+        return CHANNEL_FACTORY
+    if s in (CHANNEL_XIAOMI, "小米", "小米 mimo", "xiaomi", "mimo", "xiaomimimo"):
+        return CHANNEL_XIAOMI
+    if s in (CHANNEL_OPENCODE, "go", "opencode", "opencode-go"):
+        return CHANNEL_OPENCODE
+    return ""
+
 
 def norm_key_item(it):
     """旧数据迁移：补齐 channel / step_tier 字段，非法条目丢弃"""
@@ -2490,6 +2545,201 @@ def cline_usage_official(apikey, uid, time_key="全部", force=False, max_pages=
                                   max_pages=max_pages, data=out)
     return out
 
+# ---------- Factory (Droid) 额度查询 ----------
+def factory_install_roots():
+    """列出本机 dsh-factory-provider 插件的账号目录（用于自动发现 fk- key）。
+
+    插件把账号放在 `<plugin-home>/accounts/<id>/api-key`，并在
+    `<plugin-home>/accounts/active.json` 里记着当前启用哪个。插件家目录按
+    「用户主目录下的 .dsh-factory-provider」约定，另外把 dsh 数据目录下的
+    常见位置也作为候选，方便装在别处的人。
+    """
+    roots = []
+    try:
+        home = Path.home()
+        roots.append(home / ".dsh-factory-provider")
+    except Exception:
+        pass
+    for extra in ("DSH_HOME", "DSH_PROFILE_DIR"):
+        v = os.environ.get(extra)
+        if v:
+            try:
+                p = Path(v)
+                roots.append(p / "dsh-factory-provider")
+                roots.append(p.parent / "dsh-factory-provider")
+            except Exception:
+                pass
+    out = []
+    seen = set()
+    for r in roots:
+        try:
+            rp = r.resolve()
+        except Exception:
+            rp = r
+        if str(rp) in seen:
+            continue
+        seen.add(str(rp))
+        if rp.is_dir():
+            out.append(rp)
+    return out
+
+
+def discover_factory_keys():
+    """扫描插件账号目录，返回 [(key, label)]，active 的排最前。
+
+    只读文件，不发任何网络请求。找不到就返回空列表 —— 调用方据此提示用户
+    「手动粘贴 fk- key」。
+    """
+    found = []
+    order = []
+    for root in factory_install_roots():
+        acc = root / "accounts"
+        if not acc.is_dir():
+            continue
+        active_id = ""
+        try:
+            aj = json.loads((acc / "active.json").read_text(encoding="utf-8", errors="ignore"))
+            active_id = str(aj.get("activeId") or "")
+        except Exception:
+            pass
+        try:
+            subdirs = sorted([d for d in acc.iterdir() if d.is_dir()])
+        except Exception:
+            continue
+        for d in subdirs:
+            kp = d / "api-key"
+            if not kp.is_file():
+                continue
+            try:
+                k = kp.read_text(encoding="utf-8", errors="ignore").strip()
+            except Exception:
+                continue
+            if not k:
+                continue
+            label = d.name
+            try:
+                mj = json.loads((d / "meta.json").read_text(encoding="utf-8", errors="ignore"))
+                label = str(mj.get("label") or d.name)
+            except Exception:
+                pass
+            if d.name == active_id:
+                order.insert(0, (k, label))
+            else:
+                order.append((k, label))
+    for k, label in order:
+        if k not in [x[0] for x in found]:
+            found.append((k, label))
+    return found
+
+
+def fetch_factory_quota(apikey, force=False):
+    """查 Factory 订阅额度。返回 (data, err)。data 形如：
+        {"standard": {"fiveHour": {...}, "weekly": {...}, "monthly": {...}},
+         "core":     {...同结构...},
+         "extra_usage_balance_cents": 0, "overage_preference": "droidCore", ...}
+    单个窗口 = {"used_percent": float, "window_end": iso|None, "seconds_remaining": int|None}
+    """
+    key = (apikey or "").strip()
+    if not key:
+        return None, "未提供 Factory API Key"
+    now = time.time()
+    with _FACTORY_CACHE_LOCK:
+        if (not force and _FACTORY_CACHE.get("key") == key
+                and _FACTORY_CACHE.get("data") is not None
+                and now - float(_FACTORY_CACHE.get("at") or 0) < _FACTORY_CACHE_TTL):
+            return _FACTORY_CACHE["data"], None
+    headers = {
+        "authorization": "Bearer " + key,
+        "x-client-version": FACTORY_CLIENT_VERSION,
+        "x-factory-client": FACTORY_CLIENT_NAME,
+        "accept": "application/json",
+        "accept-encoding": "identity",
+    }
+    try:
+        req = urllib.request.Request(FACTORY_BASE + FACTORY_BILLING_PATH,
+                                     headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read(200).decode("utf-8", "replace")
+        except Exception:
+            pass
+        if e.code in (401, 403):
+            return None, "Factory 拒绝了这把 Key（HTTP %s）。请确认它是以 fk- 开头的 API key" % e.code
+        return None, "Factory 账目接口返回 HTTP %s %s" % (e.code, detail[:120])
+    except Exception as e:
+        return None, "连接 Factory 失败：%s" % str(e)[:160]
+
+    def _win(w):
+        if not isinstance(w, dict):
+            return {"used_percent": 0.0, "window_end": None, "seconds_remaining": None}
+        try:
+            pct = float(w.get("usedPercent") or 0)
+        except Exception:
+            pct = 0.0
+        we = w.get("windowEnd")
+        sr = w.get("secondsRemaining")
+        try:
+            sr = int(sr) if sr is not None else None
+        except Exception:
+            sr = None
+        return {"used_percent": pct,
+                "window_end": str(we) if isinstance(we, str) else None,
+                "seconds_remaining": sr}
+
+    limits = body.get("limits") or {}
+    data = {}
+    for pool in ("standard", "core"):
+        pw = limits.get(pool) or {}
+        data[pool] = {k: _win(pw.get(k)) for k, _label in FACTORY_WINDOW_KEYS}
+    for src, dst in (("extraUsageBalanceCents", "extra_usage_balance_cents"),
+                     ("overagePreference", "overage_preference"),
+                     ("extraUsageAllowed", "extra_usage_allowed"),
+                     ("canManageOverage", "can_manage_overage"),
+                     ("usesTokenRateLimitsBilling", "uses_token_rate_limits_billing")):
+        data[dst] = body.get(src)
+    data["fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _FACTORY_CACHE_LOCK:
+        _FACTORY_CACHE.update(at=time.time(), key=key, data=data, err="")
+    return data, None
+
+
+def factory_usage_from_ledger(time_key="全部"):
+    """Factory 的用量走 dsh 账本（provider id 形如 factory-g / factory-a / factory-o）。
+
+    返回 (usage, pids)。**找不到 provider 时必须传 []、绝不能传 None** ——
+    dsh_usage(None) 的语义是「全部渠道」，传 None 会把整台机器的用量冒充成
+    Factory 的（实测踩过：刚装插件、账本里还没有 factory 记录时，面板一度
+    显示 21946M tokens / $1890，那是全机总量）。[] 才是「该渠道没有记录」。
+    """
+    pids = []
+    # 1) 当前 Factory Key 在 dsh 凭据里的映射
+    for it in load_keys():
+        if key_channel(it) == CHANNEL_FACTORY:
+            got = [str(p) for p in (providers_for_key(it.get("key") or "") or [])
+                   if str(p).startswith("factory")]
+            if got:
+                pids = sorted(set(got))
+                break
+    # 2) 兜底：账本里实际出现过的 factory* provider
+    if not pids:
+        try:
+            data, _w, _fb = _load_dsh_any()
+            if data is not None:
+                seen = set()
+                for d in _ledger_days(data).values():
+                    for pm in (d.get("byProviderModel") or {}):
+                        pid = pm.split(":", 1)[0]
+                        if pid.startswith("factory"):
+                            seen.add(pid)
+                pids = sorted(seen)
+        except Exception:
+            pids = []
+    return dsh_usage(pids, time_key), pids
+
+
 # ---------- Grok Build 本地免密查询 ----------
 def _grok_install_roots():
     """从系统**实际记录**的位置推导 grok 数据目录。
@@ -4019,6 +4269,33 @@ __TAILWIND_SCRIPT_INLINE__
   .badge-cc { background: #dcfce7; color: #047857; border: 1px solid #bbf7d0; }
   .badge-grok { background: #f3e8ff; color: #7e22ce; border: 1px solid #e9d5ff; }
   .badge-cline { background: #e0e7ff; color: #4338ca; border: 1px solid #c7d2fe; }
+  .badge-factory { background: #ffe4e6; color: #be123c; border: 1px solid #fecdd3; }
+  .badge-xiaomi { background: #ffedd5; color: #c2410c; border: 1px solid #fed7aa; }
+
+  /* ---------- Factory 双池卡片 ----------
+     其它渠道是「一个大百分比 + 一条进度条」，Factory 有标准池和 Core 池两套，
+     所以卡内换成两行小进度条，各带自己的百分比，一眼看清两个池的差距。 */
+  .dual-pool { display: flex; flex-direction: column; justify-content: center; gap: 7px; }
+  .dp-row { display: flex; align-items: center; gap: 7px; min-width: 0; }
+  .dp-label {
+    font-size: 10px; font-weight: 600; color: var(--text-muted);
+    width: 42px; flex: none; text-align: left; letter-spacing: .2px;
+  }
+  .dp-track {
+    flex: 1 1 auto; min-width: 0; height: 7px; border-radius: 999px;
+    background: var(--bg-card-subtle);
+    border: 1px solid var(--border-subtle);
+    overflow: hidden;
+  }
+  .dp-fill { height: 100%; border-radius: 999px; transition: width .35s ease; }
+  .dp-standard { background: linear-gradient(90deg, #f43f5e, #fb7185); }
+  .dp-core     { background: linear-gradient(90deg, #8b5cf6, #a78bfa); }
+  .dp-num {
+    font-size: 12.5px; font-weight: 800; color: var(--text-primary);
+    width: 40px; flex: none; text-align: right; font-variant-numeric: tabular-nums;
+  }
+  .dp-num.warn { color: var(--accent-amber); }
+  .dp-num.danger { color: var(--accent-red); }
 
   /* ============ 模态卡片（Fluent 风） ============ */
   .modal-backdrop {
@@ -4778,13 +5055,25 @@ __TAILWIND_SCRIPT_INLINE__
           </div>
           <span id="c1-limit" class="text-[10.5px] font-mono font-medium px-2 py-0.5 rounded bg-slate-100 text-slate-600 truncate max-w-[140px] shrink-0" title="">$12.00</span>
         </div>
-        <div>
+        <div id="c1-main">
           <div class="flex items-baseline gap-1">
             <span id="c1-num" class="text-[27px] font-extrabold tracking-tight text-slate-900">--</span>
             <span id="c1-unit" class="text-xs font-semibold text-slate-400">%</span>
           </div>
           <div class="capsule-track mt-1.5 mb-2">
             <div id="c1-bar" class="capsule-fill bg-emerald-500 shadow-sm" style="width: 0%;"></div>
+          </div>
+        </div>
+        <div id="c1-pools" class="dual-pool hidden">
+          <div class="dp-row">
+            <span class="dp-label">标准池</span>
+            <div class="dp-track"><div id="c1-pool-standard" class="dp-fill dp-standard" style="width:0%"></div></div>
+            <span id="c1-pool-standard-num" class="dp-num">--</span>
+          </div>
+          <div class="dp-row">
+            <span class="dp-label">Core池</span>
+            <div class="dp-track"><div id="c1-pool-core" class="dp-fill dp-core" style="width:0%"></div></div>
+            <span id="c1-pool-core-num" class="dp-num">--</span>
           </div>
         </div>
         <div class="flex items-center justify-between text-[10.5px] pt-1 border-t border-slate-100 min-w-0">
@@ -4807,13 +5096,25 @@ __TAILWIND_SCRIPT_INLINE__
           </div>
           <span id="c2-limit" class="text-[10.5px] font-mono font-medium px-2 py-0.5 rounded bg-slate-100 text-slate-600 truncate max-w-[140px] shrink-0" title="">$30.00</span>
         </div>
-        <div>
+        <div id="c2-main">
           <div class="flex items-baseline gap-1">
             <span id="c2-num" class="text-[27px] font-extrabold tracking-tight text-slate-900">--</span>
             <span id="c2-unit" class="text-xs font-semibold text-slate-400">%</span>
           </div>
           <div class="capsule-track mt-1.5 mb-2">
             <div id="c2-bar" class="capsule-fill bg-blue-500 shadow-sm" style="width: 0%;"></div>
+          </div>
+        </div>
+        <div id="c2-pools" class="dual-pool hidden">
+          <div class="dp-row">
+            <span class="dp-label">标准池</span>
+            <div class="dp-track"><div id="c2-pool-standard" class="dp-fill dp-standard" style="width:0%"></div></div>
+            <span id="c2-pool-standard-num" class="dp-num">--</span>
+          </div>
+          <div class="dp-row">
+            <span class="dp-label">Core池</span>
+            <div class="dp-track"><div id="c2-pool-core" class="dp-fill dp-core" style="width:0%"></div></div>
+            <span id="c2-pool-core-num" class="dp-num">--</span>
           </div>
         </div>
         <div class="flex items-center justify-between text-[10.5px] pt-1 border-t border-slate-100 min-w-0">
@@ -4835,13 +5136,25 @@ __TAILWIND_SCRIPT_INLINE__
           </div>
           <span id="c3-limit" class="text-[10.5px] font-mono font-medium px-2 py-0.5 rounded bg-slate-100 text-slate-600 truncate max-w-[140px] shrink-0" title="">$60.00</span>
         </div>
-        <div>
+        <div id="c3-main">
           <div class="flex items-baseline gap-1">
             <span id="c3-num" class="text-[27px] font-extrabold tracking-tight text-slate-900">--</span>
             <span id="c3-unit" class="text-xs font-semibold text-slate-400">%</span>
           </div>
           <div class="capsule-track mt-1.5 mb-2">
             <div id="c3-bar" class="capsule-fill bg-amber-500 shadow-sm" style="width: 0%;"></div>
+          </div>
+        </div>
+        <div id="c3-pools" class="dual-pool hidden">
+          <div class="dp-row">
+            <span class="dp-label">标准池</span>
+            <div class="dp-track"><div id="c3-pool-standard" class="dp-fill dp-standard" style="width:0%"></div></div>
+            <span id="c3-pool-standard-num" class="dp-num">--</span>
+          </div>
+          <div class="dp-row">
+            <span class="dp-label">Core池</span>
+            <div class="dp-track"><div id="c3-pool-core" class="dp-fill dp-core" style="width:0%"></div></div>
+            <span id="c3-pool-core-num" class="dp-num">--</span>
           </div>
         </div>
         <div class="flex items-center justify-between text-[10.5px] pt-1 border-t border-slate-100 min-w-0">
@@ -5216,6 +5529,8 @@ const CHANNEL_DEFS = [
     { id: 'stepfun', name: '阶跃星辰 · StepFun', short: '阶跃', badgeClass: 'badge-step' },
     { id: 'grok-build', name: 'Grok Build', short: 'Grok', badgeClass: 'badge-grok' },
     { id: 'cline', name: 'Cline Pass', short: 'Cline', badgeClass: 'badge-cline' },
+    { id: 'factory', name: 'Factory (Droid)', short: 'Factory', badgeClass: 'badge-factory' },
+    { id: 'xiaomi', name: '小米 MiMo', short: 'MiMo', badgeClass: 'badge-xiaomi' },
 ];
 
 function _applyCollapseVisual(channelId) {
@@ -5445,7 +5760,7 @@ function selectKey(idx) {
 
     const ch = it.channel || 'opencode-go';
     // 未知渠道在 DOM 里归到 other 分组；旧实现直接用渠道名取 id，取不到就静默不展开
-    const groupId = ['opencode-go', 'commandcode', 'stepfun', 'grok-build', 'cline'].includes(ch) ? ch : 'other';
+    const groupId = CHANNEL_DEFS.some(c => c.id === ch) ? ch : 'other';
     // 选中的 Key 落在折叠分组里时自动展开，保证用户看得见。
     // 但**启动恢复阶段不做这件事** —— 否则用户上次特意收起的那个分组会因为
     // 里面有个被选中的 Key 又被拉开，「记忆」就白做了。用户主动点击时才展开。
@@ -5457,13 +5772,22 @@ function selectKey(idx) {
     }
 
     const isGo = ch === 'opencode-go';
-    const isCC = ch === 'commandcode';
     const isGrok = ch === 'grok-build';
-    const isCline = ch === 'cline';
     document.getElementById('hero-alias').innerText = it.alias || `Key-${idx+1}`;
+    // 徽标一律查 CHANNEL_DEFS 这张表。旧实现写死一串渠道名 + else 落到阶跃分支，
+    // 结果新增渠道（Factory / 小米）的徽标会显示成「阶跃星辰 · 1600M」。
+    const cdef = CHANNEL_DEFS.find(c => c.id === ch);
     const chBadge = document.getElementById('hero-channel-badge');
-    chBadge.innerText = isGo ? 'OpenCode Go' : (isCC ? 'Command Code' : (isGrok ? 'Grok Build' : (isCline ? 'Cline Pass' : `阶跃星辰 · ${it.step_tier || 1600}M`)));
-    chBadge.className = `badge ${isGo ? 'badge-go' : (isCC ? 'badge-cc' : (isGrok ? 'badge-grok' : (isCline ? 'badge-cline' : 'badge-step')))}`;
+    if (!cdef) {
+        chBadge.innerText = '未知渠道';
+        chBadge.className = 'badge badge-go';
+    } else if (ch === 'stepfun') {
+        chBadge.innerText = `阶跃星辰 · ${it.step_tier || 1600}M`;
+        chBadge.className = 'badge badge-step';
+    } else {
+        chBadge.innerText = cdef.name;
+        chBadge.className = `badge ${cdef.badgeClass}`;
+    }
     
     const mask = isGrok ? '本地免密 · ~/.grok/sessions' : maskKey(it.key);
     document.getElementById('hero-sub').innerText = `${mask}  ·  最后更新: ${it.last_update || '未查询'}${it.last_error ? '  ·  ⚠ 上次失败' : ''}`;
@@ -5551,7 +5875,15 @@ function resetCardsEmpty(ch) {
         barEl.style.width = '0%';
         document.getElementById(`${k}-used`).innerText = '已用 -- · 剩余 --';
         document.getElementById(`${k}-reset`).innerText = '-- 后重置';
+        // Factory 的双池行也要一起清，否则切走再切回来会残留上一个 Key 的百分比
+        ['standard', 'core'].forEach(pool => {
+            const pb = document.getElementById(`${k}-pool-${pool}`);
+            const pn = document.getElementById(`${k}-pool-${pool}-num`);
+            if (pb) pb.style.width = '0%';
+            if (pn) { pn.innerText = '--'; pn.className = 'dp-num'; }
+        });
     });
+    _useDualPoolCards(false);
     document.getElementById('hero-status-pill').innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span> 待查询';
 }
 
@@ -5559,6 +5891,9 @@ function renderResultData(data, item) {
     if (!data) return;
     try {
         const ch = data.channel || (item && item.channel) || 'opencode-go';
+        // Factory 是双池，卡内换成两行进度条；其它渠道保持「大百分比 + 单条」。
+        // 统一在这里切，省得每个 renderXxx 各自记得复位。
+        _useDualPoolCards(ch === 'factory');
         if (ch === 'stepfun') {
             renderStepFun(data, item);
         } else if (ch === 'commandcode') {
@@ -5567,6 +5902,10 @@ function renderResultData(data, item) {
             renderGrokBuild(data, item);
         } else if (ch === 'cline') {
             renderCline(data, item);
+        } else if (ch === 'factory') {
+            renderFactory(data, item);
+        } else if (ch === 'xiaomi') {
+            renderXiaomi(data, item);
         } else {
             renderGo(data);
         }
@@ -5575,6 +5914,121 @@ function renderResultData(data, item) {
     } catch(err) {
         console.error("renderResultData error:", err);
     }
+}
+
+/* Factory 双池卡片布局开关 */
+function _useDualPoolCards(on) {
+    ['c1', 'c2', 'c3'].forEach(k => {
+        const main = document.getElementById(k + '-main');
+        const pools = document.getElementById(k + '-pools');
+        if (main) main.classList.toggle('hidden', !!on);
+        if (pools) pools.classList.toggle('hidden', !on);
+    });
+}
+
+/* ================= Factory (Droid) 渲染：标准池 + Core 池 ================= */
+function renderFactory(data, item) {
+    const pools = data.pools || {};
+    const quota = data.quota || {};
+    const usage = data.usage || {};
+    const extraCents = Number(data.extra_usage_balance_cents || 0);
+
+    const DEFS = [
+        { k: 'c1', title: '5小时窗口', poolKey: 'fiveHour', limit: '标准池 / Core 池' },
+        { k: 'c2', title: '每周窗口', poolKey: 'weekly', limit: '标准池 / Core 池' },
+        { k: 'c3', title: '每月窗口', poolKey: 'monthly', limit: '标准池 / Core 池' },
+    ];
+
+    const pick = (arr, key) => (arr || []).find(w => w.key === key) || {};
+
+    DEFS.forEach(def => {
+        document.getElementById(`${def.k}-title`).innerText = def.title;
+        document.getElementById(`${def.k}-limit`).innerText = def.limit;
+        document.getElementById(`${def.k}-used`).innerText =
+            `本机用量 ${fmtTokens(usage.tokens || 0)} · ${usage.calls || 0} 次`;
+        ['standard', 'core'].forEach(pool => {
+            const w = pick(pools[pool], def.poolKey);
+            const pct = Math.max(0, Math.min(100, Number(w.used_percent || 0)));
+            const bar = document.getElementById(`${def.k}-pool-${pool}`);
+            const num = document.getElementById(`${def.k}-pool-${pool}-num`);
+            if (bar) bar.style.width = pct + '%';
+            if (num) {
+                num.innerText = pct.toFixed(pct % 1 ? 1 : 0) + '%';
+                num.className = 'dp-num' + (pct >= 90 ? ' danger' : (pct >= 70 ? ' warn' : ''));
+            }
+        });
+        // 重置倒计时取标准池的窗口（两个池的重置时间由官方各自给，这里以标准池为主）
+        const ws = pick(pools.standard, def.poolKey);
+        document.getElementById(`${def.k}-reset`).innerText = ws.seconds_remaining != null
+            ? fmtCountdown(ws.seconds_remaining) + ' 后重置'
+            : (ws.window_end ? fmtCountdown(Math.max(0, (new Date(ws.window_end) - Date.now()) / 1000)) + ' 后重置' : '-- 后重置');
+        // 高耗预警取两个池里更高的那个
+        const a = Number(pick(pools.standard, def.poolKey).used_percent || 0);
+        const b = Number(pick(pools.core, def.poolKey).used_percent || 0);
+        _applyCardWarning('card-' + def.k, def.k + '-warn', Math.max(a, b));
+    });
+
+    const pill = document.getElementById('hero-status-pill');
+    const over = data.overage_preference ? `超额走 ${data.overage_preference}` : '双池额度';
+    const extra = extraCents > 0 ? ` · 额外余额 $${(extraCents / 100).toFixed(2)}` : '';
+    const txt = `${over}${extra} · 本机用量 ${fmtTokens(usage.tokens || 0)}`;
+    pill.className = 'inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-rose-50 text-rose-700 border border-rose-200 min-w-0 max-w-[300px] truncate';
+    pill.title = txt;
+    pill.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-rose-500 shrink-0"></span> <span class="truncate">' + esc(txt) + '</span>';
+}
+
+/* ================= 小米 MiMo 渲染：只有用量，没有余额 ================= */
+function renderXiaomi(data, item) {
+    const usage = data.usage || {};
+    const models = data.per_model || [];
+
+    document.getElementById('c1-title').innerText = '本机用量';
+    document.getElementById('c2-title').innerText = '缓存与费用';
+    document.getElementById('c3-title').innerText = '余额查询';
+    document.getElementById('c1-limit').innerText = 'dsh 账本';
+    document.getElementById('c2-limit').innerText = '估算';
+    document.getElementById('c3-limit').innerText = '官方未开放';
+
+    const setCard = (k, num, unit, pct, usedText, resetText, color) => {
+        document.getElementById(`${k}-num`).innerText = num;
+        document.getElementById(`${k}-unit`).innerText = unit;
+        const bar = document.getElementById(`${k}-bar`);
+        bar.style.display = '';
+        bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+        bar.className = 'capsule-fill ' + color + ' shadow-sm';
+        document.getElementById(`${k}-used`).innerText = usedText;
+        document.getElementById(`${k}-reset`).innerText = resetText;
+    };
+
+    const tok = usage.tokens || 0;
+    setCard('c1', fmtTokens(tok), '', 100, `${usage.calls || 0} 次调用`, '累计全部时间', 'bg-orange-500');
+    setCard('c2', '$' + (usage.cost || 0).toFixed(2), '', 100, `${models.length} 个模型`, '按账本折算', 'bg-amber-500');
+    setCard('c3', '--', '', 0, '请到 platform.xiaomimimo.com 查看', '需浏览器登录', 'bg-slate-400');
+    ['c1', 'c2', 'c3'].forEach(k => _applyCardWarning('card-' + k, k + '-warn', 0));
+
+    const pill = document.getElementById('hero-status-pill');
+    const txt = data.balance_note || '小米只统计本机用量';
+    pill.className = 'inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-orange-50 text-orange-700 border border-orange-200 min-w-0 max-w-[320px] truncate';
+    pill.title = txt;
+    pill.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-orange-500 shrink-0"></span> <span class="truncate">' + esc(txt) + '</span>';
+}
+
+/* 秒数 → 「2天3小时」这种倒计时文案 */
+function fmtCountdown(sec) {
+    sec = Math.max(0, Math.floor(Number(sec) || 0));
+    const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
+    if (d > 0) return d + '天' + h + '小时';
+    if (h > 0) return h + '小时' + m + '分';
+    return m + '分';
+}
+
+/* 数量 → 1.2B / 345.6M / 12.3K */
+function fmtTokens(n) {
+    n = Number(n) || 0;
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+    return String(Math.round(n));
 }
 
 /* 没有数据时把「原始技术回执」恢复成占位提示，避免残留上一个 Key 的 JSON */
@@ -7143,12 +7597,11 @@ function selectChannelInModal(ch) {
     _modalChannel = ch;
     document.getElementById('channel-go').classList.toggle('selected', ch === 'opencode-go');
     document.getElementById('channel-stepfun').classList.toggle('selected', ch === 'stepfun');
-    const ccEl = document.getElementById('channel-commandcode');
-    if (ccEl) ccEl.classList.toggle('selected', ch === 'commandcode');
-    const grokEl = document.getElementById('channel-grok');
-    if (grokEl) grokEl.classList.toggle('selected', ch === 'grok-build');
-    const clineEl = document.getElementById('channel-cline');
-    if (clineEl) clineEl.classList.toggle('selected', ch === 'cline');
+    ['commandcode', 'grok', 'cline', 'xiaomi', 'factory'].forEach((id, i) => {
+        const map = ['commandcode', 'grok-build', 'cline', 'xiaomi', 'factory'];
+        const el = document.getElementById('channel-' + id);
+        if (el) el.classList.toggle('selected', ch === map[i]);
+    });
     document.getElementById('add-key-tier-row').style.display = (ch === 'stepfun') ? '' : 'none';
 
     const keyInp = document.getElementById('add-key-value');
@@ -7168,11 +7621,32 @@ function selectChannelInModal(ch) {
             keyInp.value = '';
             if (aliasInp.value === 'Grok Build') aliasInp.value = '';
         }
-        keyInp.placeholder = 'sk-…';
         keyInp.readOnly = false;
         keyInp.style.opacity = '1';
         if (eyeBtn) eyeBtn.style.display = '';
         if (keyLabel) keyLabel.innerText = 'API Key';
+        if (ch === 'factory') {
+            if (!aliasInp.value || aliasInp.value.startsWith('Key-')) aliasInp.value = 'Factory';
+            keyInp.placeholder = 'fk-…（可点右侧从本机插件自动读取）';
+            // Factory 的 key 就放在本机 dsh-factory-provider 的账号目录里，直接帮用户填上，
+            // 省得他去翻文件。读不到再让他手输。
+            if (!keyInp.value) {
+                apiCall('discover_factory_key', [], 8000).then(r => {
+                    if (r && r.key && !keyInp.value) {
+                        keyInp.value = r.key;
+                        if (r.label && (!aliasInp.value || aliasInp.value === 'Factory')) {
+                            aliasInp.value = 'Factory · ' + r.label;
+                        }
+                        showToast('已从本机插件读取到 Factory Key', 'success', 1600);
+                    }
+                }).catch(() => {});
+            }
+        } else if (ch === 'xiaomi') {
+            if (!aliasInp.value || aliasInp.value.startsWith('Key-')) aliasInp.value = '小米 MiMo';
+            keyInp.placeholder = 'sk-…（小米 API Key）';
+        } else {
+            keyInp.placeholder = 'sk-…';
+        }
     }
 }
 
@@ -7727,6 +8201,26 @@ if (window.pywebview && window.pywebview.api) {
             </div>
             <div class="co-radio"></div>
           </div>
+          <div id="channel-xiaomi" class="channel-option" onclick="selectChannelInModal('xiaomi')">
+            <div class="co-icon" style="background:#ffedd5;">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#c2410c" stroke-width="2.2"><rect x="3" y="3" width="18" height="18" rx="4"></rect><path d="M8 12h8M12 8v8"></path></svg>
+            </div>
+            <div>
+              <div class="co-title">小米 MiMo</div>
+              <div class="co-desc">api.xiaomimimo.com · 只看本机用量（官方未开放按 Key 查余额）</div>
+            </div>
+            <div class="co-radio"></div>
+          </div>
+          <div id="channel-factory" class="channel-option" onclick="selectChannelInModal('factory')">
+            <div class="co-icon" style="background:#ffe4e6;">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#be123c" stroke-width="2.2"><path d="M3 21h18M5 21V8l7-5 7 5v13"></path><path d="M9 21v-6h6v6"></path></svg>
+            </div>
+            <div>
+              <div class="co-title">Factory (Droid)</div>
+              <div class="co-desc">api.factory.ai · 双池额度（标准池 + Core 池）· fk- 开头的 Key</div>
+            </div>
+            <div class="co-radio"></div>
+          </div>
         </div>
 
         <div id="add-key-value-row">
@@ -8150,6 +8644,10 @@ class DesktopAPI:
                     data, err = self._query_grok_backend(it)
                 elif ch == CHANNEL_CLINE:
                     data, err = self._query_cline_backend(it)
+                elif ch == CHANNEL_FACTORY:
+                    data, err = self._query_factory_backend(it)
+                elif ch == CHANNEL_XIAOMI:
+                    data, err = self._query_xiaomi_backend(it)
                 else:
                     data, err = fetch_usage(it.get("key"))
             except Exception as e:
@@ -8344,6 +8842,102 @@ class DesktopAPI:
         }
         return data, None
 
+    def _query_factory_backend(self, it):
+        """Factory (Droid)：订阅账单端点给的**双池**额度（标准池 + Core 池）+ 本地用量。
+
+        两个池各带 5小时 / 每周 / 每月 三个窗口，都是官方 usedPercent。
+        用量取 dsh 账本里 factory* provider 的数据（provider id 形如
+        factory-g / factory-a / factory-o，来自本机 dsh-factory-provider 插件）。
+        """
+        key = it.get("key", "")
+        # 插件账号目录里存着的 key 直接可用；用户手输的也照发
+        quota, err = fetch_factory_quota(key, force=True)
+        if quota is None:
+            return None, err
+        usage, pids = factory_usage_from_ledger("全部")
+        totals = (usage or {}).get("totals") or {}
+        data = {
+            "channel": CHANNEL_FACTORY,
+            "quota": quota,
+            "pools": {
+                k: [{"key": wk, "label": wl, **quota[k][wk]} for wk, wl in FACTORY_WINDOW_KEYS]
+                for k in ("standard", "core")
+            },
+            "extra_usage_balance_cents": quota.get("extra_usage_balance_cents"),
+            "overage_preference": quota.get("overage_preference"),
+            "extra_usage_allowed": quota.get("extra_usage_allowed"),
+            "providers": pids,
+            "usage": {
+                "tokens": totals.get("tokens_with_cache") or 0,
+                "cost": totals.get("cost") or 0.0,
+                "calls": totals.get("sessions") or 0,
+            },
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        return data, None
+
+    def _query_xiaomi_backend(self, it):
+        """小米 MiMo：**只做用量归属，不查余额**。
+
+        小米没有开放「用 API Key 查余额」（实测 balance 端点 401 / 404，
+        见 XIAOMI_BASE 上方注释）。所以这里不假装能查，直接把账本里
+        xiaomi provider 的用量给出来，并说明余额要去官网看。
+        """
+        key = it.get("key", "")
+        pids = providers_for_key(key)
+        if not pids:
+            # 兜底：账本里但凡有 xiaomi* 的 provider 就算它的
+            try:
+                data_all, _w, _fb = _load_dsh_any()
+                got = set()
+                if data_all is not None:
+                    for d in _ledger_days(data_all).values():
+                        for pm in (d.get("byProviderModel") or {}):
+                            pid = pm.split(":", 1)[0]
+                            if pid.startswith("xiaomi"):
+                                got.add(pid)
+                pids = sorted(got)
+            except Exception:
+                pids = []
+        # 传 [] 而不是 None —— None 是「全部渠道」，会把全机用量冒充成小米的
+        usage = dsh_usage(pids, "全部")
+        totals = (usage or {}).get("totals") or {}
+        zero = not (totals.get("tokens_with_cache") or totals.get("sessions"))
+        data = {
+            "channel": CHANNEL_XIAOMI,
+            "balance_supported": False,
+            "balance_note": "小米未开放按 API Key 查余额（官方后台是浏览器登录）。"
+                            "这里只统计本机 dsh 账本里的小米用量；余额请到 "
+                            "platform.xiaomimimo.com 查看。",
+            "providers": pids,
+            "usage": {
+                "tokens": totals.get("tokens_with_cache") or 0,
+                "cost": totals.get("cost") or 0.0,
+                "calls": totals.get("sessions") or 0,
+            },
+            "per_model": (usage or {}).get("per_model") or [],
+            "hint": ("该 Key 未在 dsh 账本里对应到小米渠道，统计为 0"
+                     if (zero and not pids) else None),
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        return data, None
+
+    @js_safe
+    def discover_factory_key(self):
+        """给添加密钥弹窗用：从本机 dsh-factory-provider 插件账号目录读出 fk- key。
+
+        只读本地文件、不发网络请求。读不到返回 {"key": ""}，前端据此让用户手输。
+        """
+        try:
+            found = discover_factory_keys()
+        except Exception as e:
+            return {"key": "", "label": "", "error": str(e)[:160]}
+        if not found:
+            return {"key": "", "label": "",
+                    "error": "没在本机找到 dsh-factory-provider 的账号目录，请手动粘贴 fk- 开头的 Key"}
+        k, label = found[0]
+        return {"key": k, "label": label, "count": len(found)}
+
     @js_safe
     def query_all(self, timeout=90):
         """并发刷新所有 Key。
@@ -8451,22 +9045,13 @@ class DesktopAPI:
     def add_key(self, alias, key, channel, tier):
         self.keys = load_keys()
         alias = alias.strip() if alias else f"Key-{len(self.keys)+1}"
-        ch_str = str(channel or "").strip().lower()
-        if ch_str in (CHANNEL_GROK, "grok", "grok-build", "grokbuild"):
-            ch_code = CHANNEL_GROK
+        ch_code = _channel_code(channel)
+        if not ch_code:
+            return {"error": "未知渠道：%s" % str(channel)[:40], "keys": self.keys}
+        if ch_code == CHANNEL_GROK:
             key = "local-grok-session"
             if not alias or alias.startswith("Key-"):
                 alias = "Grok Build"
-        elif ch_str in (CHANNEL_COMMANDCODE, "command code", "commandcode", "cc", "command"):
-            ch_code = CHANNEL_COMMANDCODE
-        elif ch_str in (CHANNEL_CLINE, "cline", "cline pass", "clinepass", "cline-pass"):
-            ch_code = CHANNEL_CLINE
-        elif ch_str in (CHANNEL_STEPFUN, "阶跃", "阶跃星辰", "stepfun"):
-            ch_code = CHANNEL_STEPFUN
-        elif ch_str in (CHANNEL_OPENCODE, "go", "opencode", "opencode-go"):
-            ch_code = CHANNEL_OPENCODE
-        else:
-            ch_code = CHANNEL_OPENCODE
 
         if ch_code == CHANNEL_GROK:
             if any(k.get("channel") == CHANNEL_GROK for k in self.keys):
@@ -8496,20 +9081,11 @@ class DesktopAPI:
             return {"error": "无效的 Key 索引", "keys": self.keys}
         alias = alias.strip() if alias else f"Key-{target_idx+1}"
         
-        ch_str = str(channel or "").strip().lower()
-        if ch_str in (CHANNEL_GROK, "grok", "grok-build", "grokbuild"):
-            ch_code = CHANNEL_GROK
+        ch_code = _channel_code(channel)
+        if not ch_code:
+            return {"error": "未知渠道：%s" % str(channel)[:40], "keys": self.keys}
+        if ch_code == CHANNEL_GROK:
             key = "local-grok-session"
-        elif ch_str in (CHANNEL_COMMANDCODE, "command code", "commandcode", "cc", "command"):
-            ch_code = CHANNEL_COMMANDCODE
-        elif ch_str in (CHANNEL_CLINE, "cline", "cline pass", "clinepass", "cline-pass"):
-            ch_code = CHANNEL_CLINE
-        elif ch_str in (CHANNEL_STEPFUN, "阶跃", "阶跃星辰", "stepfun"):
-            ch_code = CHANNEL_STEPFUN
-        elif ch_str in (CHANNEL_OPENCODE, "go", "opencode", "opencode-go"):
-            ch_code = CHANNEL_OPENCODE
-        else:
-            ch_code = CHANNEL_OPENCODE
 
         if ch_code != CHANNEL_GROK:
             key = key.strip()
@@ -8671,6 +9247,22 @@ class DesktopAPI:
 
                 use_dsh = source.startswith("dsh")
                 providers = providers_for_key(it.get("key", ""))
+                # Factory 的 Key 存在插件自己的账号目录里，**不在** dsh 凭据的 refs 里，
+                # 所以 providers_for_key 永远查不到它。这里按渠道补一次账本扫描，让
+                # 「用量与模型分析」面板和 Factory 卡片显示的用量是同一个口径。
+                if not providers and key_channel(it) == CHANNEL_FACTORY:
+                    try:
+                        data_all, _w, _fb = _load_dsh_any()
+                        if data_all is not None:
+                            got = set()
+                            for d in _ledger_days(data_all).values():
+                                for pm in (d.get("byProviderModel") or {}):
+                                    pid = pm.split(":", 1)[0]
+                                    if pid.startswith("factory"):
+                                        got.add(pid)
+                            providers = sorted(got)
+                    except Exception:
+                        providers = []
                 if use_dsh:
                     data = dsh_usage(providers, time_key)
                     if not providers and not data.get("hint"):
